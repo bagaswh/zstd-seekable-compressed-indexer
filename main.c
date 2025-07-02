@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include <argp.h>
 #include <errno.h>
 #include <error.h>
 #include <stdint.h>
@@ -8,12 +9,300 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#include "zstd.h"
+#include "zstd_seekable.h"
+
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
+int compress_main(int argc, char **argv);
+int info_main(int argc, char **argv);
+
+struct subcommand {
+	const char *name;
+	int (*func)(int argc, char **argv);
+	const char *description;
+};
+
+static struct subcommand subcommands[] = {
+    {"compress", compress_main, "Compress files"},
+    // {"decompress", decompress_main, "Decompress files"},
+    {"info", info_main, "Show file information"},
+    {NULL, NULL, NULL}};
+
+void print_usage(const char *program_name) {
+	printf("Usage: %s <subcommand> [options]\n\n", program_name);
+	printf("Available subcommands:\n");
+	for (int i = 0; subcommands[i].name; i++) {
+		printf("  %-12s %s\n", subcommands[i].name, subcommands[i].description);
+	}
+	printf("\nUse '%s <subcommand> --help' for subcommand-specific options.\n", program_name);
+}
+
+#define ERR_OK 0
+#define ERR_ALLOC 1
+#define ERR_ZSTD_INIT 2
+#define ERR_ZSTD_COMPRESS 3
+
+/* Utils */
+typedef enum {
+	ERROR_fsize = 1,
+	ERROR_fopen = 2,
+	ERROR_fclose = 3,
+	ERROR_fread = 4,
+	ERROR_fwrite = 5,
+	ERROR_loadFile = 6,
+	ERROR_saveFile = 7,
+	ERROR_malloc = 8,
+	ERROR_largeFile = 9,
+	ERROR_fflush = 10,
+} COMMON_ErrorCode;
+
+#define CHECK(cond, ...)                        \
+	do {                                        \
+		if (!(cond)) {                          \
+			fprintf(stderr,                     \
+			        "%s:%d CHECK(%s) failed: ", \
+			        __FILE__,                   \
+			        __LINE__,                   \
+			        #cond);                     \
+			fprintf(stderr, "" __VA_ARGS__);    \
+			fprintf(stderr, "\n");              \
+			exit(1);                            \
+		}                                       \
+	} while (0)
+
+#define CHECK_ZSTD(fn)                                           \
+	do {                                                         \
+		size_t const err = (fn);                                 \
+		CHECK(!ZSTD_isError(err), "%s", ZSTD_getErrorName(err)); \
+	} while (0)
+
+FILE *fopen_orDie(const char *filename, const char *instruction) {
+	FILE *const inFile = fopen(filename, instruction);
+	if (inFile) return inFile;
+	/* error */
+	perror(filename);
+	exit(ERROR_fopen);
+}
+
+size_t fread_orDie(void *buffer, size_t sizeToRead, FILE *file) {
+	size_t const readSize = fread(buffer, 1, sizeToRead, file);
+	if (readSize == sizeToRead)
+		return readSize; /* good */
+	if (feof(file))
+		return readSize; /* good, reached end of file */
+	/* error */
+	perror("fread");
+	exit(ERROR_fread);
+}
+
+size_t fwrite_orDie(const void *buffer, size_t sizeToWrite, FILE *file) {
+	size_t const writtenSize = fwrite(buffer, 1, sizeToWrite, file);
+	if (writtenSize == sizeToWrite) return sizeToWrite; /* good */
+	/* error */
+	perror("fwrite");
+	exit(ERROR_fwrite);
+}
+
+int fflush_orDie(FILE *file) {
+	int const ret = fflush(file);
+	if (ret == 0) return 0;
+	/* error */
+	perror("fflush");
+	exit(ERROR_fflush);
+}
+
+void *malloc_orDie(size_t size) {
+	void *const buff = malloc(size);
+	if (buff)
+		return buff;
+	/* error */
+	perror("malloc");
+	exit(ERROR_malloc);
+}
+
+int main(int argc, char **argv) {
+	if (argc < 2) {
+		print_usage(argv[0]);
+		return 1;
+	}
+
+	// Find and execute subcommand
+	for (int i = 0; subcommands[i].name; i++) {
+		if (strcmp(argv[1], subcommands[i].name) == 0) {
+			// Shift arguments: subcommand becomes argv[0]
+			return subcommands[i].func(argc - 1, argv + 1);
+		}
+	}
+
+	printf("Unknown subcommand: %s\n", argv[1]);
+	print_usage(argv[0]);
+	return 1;
+}
+
 #define ZSTD_MAGICNUMBER 0xFD2FB528
+
+int compress_main(int argc, char **argv) {
+	char *infile = NULL;
+	char *outfile = NULL;
+	int level = 10;
+	int frame_size = 65536;
+	int verbose = 0;
+
+	static struct option long_options[] = {
+	    {"infile", required_argument, 0, 'i'},
+	    {"outfile", required_argument, 0, 'o'},
+	    {"level", required_argument, 0, 'l'},
+	    {"frame-size", required_argument, 0, 's'},
+	    {"verbose", no_argument, 0, 'v'},
+	    {"help", no_argument, 0, 'h'},
+	    {0, 0, 0, 0}};
+
+	while (1) {
+		int c = getopt_long(argc, argv, "i:o:l:s:vh", long_options, NULL);
+		if (c == -1) break;
+
+		switch (c) {
+		case 'i':
+			infile = optarg;
+			break;
+		case 'o':
+			outfile = optarg;
+			break;
+		case 'l':
+			level = atoi(optarg);
+			break;
+		case 's':
+			frame_size = atoi(optarg);
+			break;
+		case 'v':
+			verbose = 1;
+			break;
+		case 'h':
+			printf("Usage: %s [options]\n", argv[0]);
+			printf("Options:\n");
+			printf("  -i, --infile FILE     Input file (default: stdin)\n");
+			printf("  -o, --outfile FILE    Output file (default: stdout)\n");
+			printf("  -l, --level INT       Compression level (default: 10)\n");
+			printf("  -s, --frame-size INT  Frame size (default: 65536)\n");
+			printf("  -v, --verbose         Enable verbose output\n");
+			printf("  -h, --help            Show this help\n");
+			return 0;
+		case '?':
+			return 1;
+		}
+	}
+
+	printf("Compressing with level %d, frame size %d\n", level, frame_size);
+	if (infile) printf("Input: %s\n", infile);
+	if (outfile) printf("Output: %s\n", outfile);
+	if (verbose) printf("Verbose mode enabled\n");
+
+	int ret = ERR_OK;
+
+	FILE *in = infile ? fopen_orDie(infile, "rb") : stdin;
+	FILE *out = outfile ? fopen_orDie(outfile, "wb") : stdout;
+
+	ZSTD_seekable_CStream *zcs = ZSTD_seekable_createCStream();
+	if (zcs == NULL) {
+		return ERR_ZSTD_INIT;
+	}
+
+	size_t const buff_in_size = ZSTD_CStreamInSize();
+	void *const buff_in = malloc_orDie(buff_in_size);
+	size_t const buff_out_size = ZSTD_CStreamOutSize();
+	void *const buff_out = malloc_orDie(buff_out_size);
+
+	size_t const init_result =
+	    ZSTD_seekable_initCStream(zcs, level, 1, frame_size);
+	if (ZSTD_isError(init_result)) {
+		fprintf(stderr, "ZSTD_seekable_initCStream() error : %s \n",
+		        ZSTD_getErrorName(init_result));
+		exit(11);
+	}
+
+	size_t read, to_read = buff_in_size;
+	while ((read = fread_orDie(buff_in, to_read, in))) {
+		ZSTD_inBuffer input = {buff_in, read, 0};
+		while (input.pos < input.size) {
+			ZSTD_outBuffer output = {buff_out, buff_out_size, 0};
+			to_read = ZSTD_seekable_compressStream(zcs, &output, &input);
+			if (ZSTD_isError(to_read)) {
+				fprintf(stderr, "ZSTD_seekable_compressStream() error : %s \n",
+				        ZSTD_getErrorName(to_read));
+				exit(12);
+			}
+			if (to_read > buff_in_size)
+				to_read = buff_in_size;
+			fwrite_orDie(buff_out, output.pos, out);
+		}
+	}
+
+	while (1) {
+		ZSTD_outBuffer output = {buff_out, buff_out_size, 0};
+		size_t const remaining_to_flush = ZSTD_seekable_endStream(zcs, &output);
+		CHECK_ZSTD(remaining_to_flush);
+		fwrite_orDie(buff_out, output.pos, out);
+		if (!remaining_to_flush) {
+			break;
+		}
+	}
+
+	ZSTD_seekable_freeCStream(zcs);
+	free(buff_in);
+	free(buff_out);
+
+	return ret;
+}
+
+struct seek_table_entry {
+	u32 compressed_size;
+	u32 decompressed_size;
+	u32 checksum;
+};
+
+#define ZSTD_MAGICNUMBER 0xFD2FB528
+#define ZSTD_SEEKABLE_MAGICNUMBER 0x8F92EAB1
+#define ZSTD_SEEKTABLE_FOOTER_SIZE 9
+
+void zstd_seekable_print_info(u8 *data, size_t file_size) {
+	u8 *footer_ptr = data + file_size - ZSTD_SEEKTABLE_FOOTER_SIZE;
+
+	u32 footer_magic;
+	memcpy(&footer_magic, footer_ptr + 5, sizeof(u32));
+	if (footer_magic != ZSTD_SEEKABLE_MAGICNUMBER) {
+		fprintf(stderr, "Invalid footer magic number, got: %x\n", footer_magic);
+		return;
+	}
+
+	u32 num_of_frames;
+	memcpy(&num_of_frames, footer_ptr, sizeof(u32));
+	printf("Number of frames: %d\n", num_of_frames);
+
+	u8 seek_table_descriptor;
+	memcpy(&seek_table_descriptor, footer_ptr + 4, sizeof(u8));
+
+	u32 entry_size = 8;
+
+	u8 checksum_flag = (seek_table_descriptor >> 7) & 0x1;
+	if (checksum_flag) {
+		printf("Checksum: enabled\n");
+		entry_size += 4;
+	}
+
+	// u8 *seek_table_ptr = footer_ptr - (entry_size * num_of_frames);
+	// struct seek_table_entry *entry = malloc(sizeof(struct seek_table_entry));
+	// memset(entry, 0, sizeof(struct seek_table_entry));
+	// for (int i = 0; i < num_of_frames; i++) {
+	// 	memcpy(entry, seek_table_ptr + i * entry_size, entry_size);
+	// 	printf("Frame %d: compressed_size: %d, decompressed_size: %d, checksum: %x\n", i, entry->compressed_size, entry->decompressed_size, entry->checksum);
+	// }
+
+	// free(entry);
+}
 
 void stringify_bits(u8 byte, char *result) {
 	for (int bit = 0; bit < (sizeof(u8) * 8); bit++) {
@@ -23,24 +312,23 @@ void stringify_bits(u8 byte, char *result) {
 	}
 }
 
-int print_frame_header(u8 *ptr) {
-	u8 *data = (u8 *)ptr;
+void print_frame(u8 *ptr) {
 	size_t offset = 0;
 
 	u32 magic;
-	memcpy(&magic, data + offset, sizeof(u32));
+	memcpy(&magic, ptr + offset, sizeof(u32));
 	offset += sizeof(u32);  // 4 byte magic
 
 	if (magic != ZSTD_MAGICNUMBER) {
 		printf("Invalid magic number\n");
-		return 1;
+		return;
 	}
 	printf("Magic: %x\n", magic);
 
 	/* Frame header */
 
 	/* Frame header descriptor (1 byte) */
-	u8 frame_header_descriptor = data[offset++];
+	u8 frame_header_descriptor = ptr[offset++];
 
 	char *fhd_bits = malloc(9);
 	fhd_bits[8] = '\0';
@@ -75,7 +363,7 @@ int print_frame_header(u8 *ptr) {
 
 	/* Window descriptor (0-1 byte) */
 	if (!single_segment) {
-		u8 window_descriptor = data[offset++];
+		u8 window_descriptor = ptr[offset++];
 		printf("Window descriptor: %x\n", window_descriptor);
 	}
 
@@ -85,7 +373,7 @@ int print_frame_header(u8 *ptr) {
 		int dict_size = dictionary_id_flag;  // 1, 2, or 3 bytes
 		if (dictionary_id_flag == 3) dict_size = 4;
 
-		memcpy(&dictionary_id, data + offset, dict_size);
+		memcpy(&dictionary_id, ptr + offset, dict_size);
 		offset += dict_size;
 		printf("Dictionary ID: %x\n", dictionary_id);
 	}
@@ -93,14 +381,14 @@ int print_frame_header(u8 *ptr) {
 	/* Frame content size (0-8 bytes) */
 	if (fcs_bytes > 0) {
 		u64 frame_content_size = 0;
-		memcpy(&frame_content_size, data + offset, fcs_bytes);
+		memcpy(&frame_content_size, ptr + offset, fcs_bytes);
 
 		if (fcs_bytes == 2) {
 			frame_content_size += 256;
 		}
 		offset += fcs_bytes;
 
-		printf("Frame content size: %llu\n", frame_content_size);
+		printf("Frame content size: %ld\n", frame_content_size);
 	} else {
 		printf("Frame content size: not present\n");
 	}
@@ -110,40 +398,66 @@ int print_frame_header(u8 *ptr) {
 	}
 
 	free(fhd_bits);
-	return offset;
 }
 
-int main(int argc, char *argv[]) {
-	if (argc < 2) {
-		printf("Usage: %s <file>\n", argv[0]);
-		return 1;
+int info_main(int argc, char **argv) {
+	char *infile = NULL;
+	char *outfile = NULL;
+
+	static struct option long_options[] = {
+	    {"infile", required_argument, 0, 'i'},
+	    {"outfile", required_argument, 0, 'o'},
+	    {"help", no_argument, 0, 'h'},
+	    {0, 0, 0, 0}};
+
+	while (1) {
+		int c = getopt_long(argc, argv, "i:o:l:s:vh", long_options, NULL);
+		if (c == -1) break;
+
+		switch (c) {
+		case 'i':
+			infile = optarg;
+			break;
+		case 'o':
+			outfile = optarg;
+			break;
+		case 'h':
+			printf("Usage: %s [options]\n", argv[0]);
+			printf("Options:\n");
+			printf("  -i, --infile FILE     Input file (default: stdin)\n");
+			printf("  -o, --outfile FILE    Output file (default: stdout)\n");
+			printf("  -h, --help            Show this help\n");
+			return 0;
+		case '?':
+			return 1;
+		}
 	}
 
-	FILE *f = fopen(argv[1], "rb");
-	if (f == NULL) {
-		printf("Failed to open file: %s\n", strerror(errno));
-		return 1;
-	}
+	if (infile) printf("Input: %s\n", infile);
+	if (outfile) printf("Output: %s\n", outfile);
+
+	FILE *in = infile ? fopen_orDie(infile, "rb") : stdin;
 
 	struct stat st;
-	if (fstat(fileno(f), &st) != 0) {
+	if (fstat(fileno(in), &st) != 0) {
 		printf("Failed to stat file: %s\n", strerror(errno));
 		return 1;
 	}
 
-	char *ptr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fileno(f), 0);
+	u8 *ptr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fileno(in), 0);
 	if (ptr == MAP_FAILED) {
 		printf("Failed to map file: %s\n", strerror(errno));
 		return 1;
 	}
-	fclose(f);
 
-	int frame_index = 0;
-	// for (;;) {
-	printf("------ Frame %d ------\n", frame_index);
-	int offset = print_frame_header(ptr);
+	// Print first frame
+	printf("--- Frame 0 ---\n");
+	print_frame(ptr);
 	printf("\n");
-	// }
+
+	// Print seektable entries
+	printf("--- Seektable ---\n");
+	zstd_seekable_print_info(ptr, st.st_size);
 
 	return 0;
 }
