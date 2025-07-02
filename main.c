@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -22,30 +23,13 @@ void stringify_bits(u8 byte, char *result) {
 	}
 }
 
-int main(int argc, char *argv[]) {
-	if (argc < 2) {
-		printf("Usage: %s <file>\n", argv[0]);
-		return 1;
-	}
-
-	FILE *f = fopen(argv[1], "rb");
-	if (f == NULL) {
-		printf("Failed to open file: %s\n", strerror(errno));
-		return 1;
-	}
-	char *ptr = mmap(NULL, 1024 * 1024, PROT_READ, MAP_PRIVATE, fileno(f), 0);
-	if (ptr == MAP_FAILED) {
-		printf("Failed to map file: %s\n", strerror(errno));
-		return 1;
-	}
-	fclose(f);
-
+int print_frame_header(u8 *ptr) {
 	u8 *data = (u8 *)ptr;
 	size_t offset = 0;
 
 	u32 magic;
 	memcpy(&magic, data + offset, sizeof(u32));
-	offset += sizeof(u32);
+	offset += sizeof(u32);  // 4 byte magic
 
 	if (magic != ZSTD_MAGICNUMBER) {
 		printf("Invalid magic number\n");
@@ -53,6 +37,9 @@ int main(int argc, char *argv[]) {
 	}
 	printf("Magic: %x\n", magic);
 
+	/* Frame header */
+
+	/* Frame header descriptor (1 byte) */
 	u8 frame_header_descriptor = data[offset++];
 
 	char *fhd_bits = malloc(9);
@@ -86,11 +73,13 @@ int main(int argc, char *argv[]) {
 	printf("\tContent checksum: %d\n", content_checksum);
 	printf("\tDictionary ID flag: %d\n", dictionary_id_flag);
 
+	/* Window descriptor (0-1 byte) */
 	if (!single_segment) {
 		u8 window_descriptor = data[offset++];
 		printf("Window descriptor: %x\n", window_descriptor);
 	}
 
+	/* Dictionary ID (0-4 bytes) */
 	if (dictionary_id_flag > 0) {
 		u32 dictionary_id = 0;
 		int dict_size = dictionary_id_flag;  // 1, 2, or 3 bytes
@@ -101,6 +90,7 @@ int main(int argc, char *argv[]) {
 		printf("Dictionary ID: %x\n", dictionary_id);
 	}
 
+	/* Frame content size (0-8 bytes) */
 	if (fcs_bytes > 0) {
 		u64 frame_content_size = 0;
 		memcpy(&frame_content_size, data + offset, fcs_bytes);
@@ -108,12 +98,52 @@ int main(int argc, char *argv[]) {
 		if (fcs_bytes == 2) {
 			frame_content_size += 256;
 		}
+		offset += fcs_bytes;
 
 		printf("Frame content size: %llu\n", frame_content_size);
 	} else {
 		printf("Frame content size: not present\n");
 	}
 
+	if (content_checksum) {
+		offset += 4;
+	}
+
 	free(fhd_bits);
+	return offset;
+}
+
+int main(int argc, char *argv[]) {
+	if (argc < 2) {
+		printf("Usage: %s <file>\n", argv[0]);
+		return 1;
+	}
+
+	FILE *f = fopen(argv[1], "rb");
+	if (f == NULL) {
+		printf("Failed to open file: %s\n", strerror(errno));
+		return 1;
+	}
+
+	struct stat st;
+	if (fstat(fileno(f), &st) != 0) {
+		printf("Failed to stat file: %s\n", strerror(errno));
+		return 1;
+	}
+
+	char *ptr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fileno(f), 0);
+	if (ptr == MAP_FAILED) {
+		printf("Failed to map file: %s\n", strerror(errno));
+		return 1;
+	}
+	fclose(f);
+
+	int frame_index = 0;
+	// for (;;) {
+	printf("------ Frame %d ------\n", frame_index);
+	int offset = print_frame_header(ptr);
+	printf("\n");
+	// }
+
 	return 0;
 }
