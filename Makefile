@@ -1,7 +1,7 @@
 CC = clang
-COMMON_CFLAGS = -Wall -Wextra -pedantic -Werror -std=c17 -march=native
-DEBUG_CFLAGS = $(COMMON_CFLAGS) -O3 -Wall -Wextra -g -DDEBUG
-ASAN_CFLAGS = $(COMMON_CFLAGS) -O3 -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls -fno-common
+COMMON_CFLAGS = -std=c17 -march=native
+DEBUG_CFLAGS = $(COMMON_CFLAGS) -O0 -g -DDEBUG
+ASAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls -fno-common
 
 BUILD_DIR = build
 TARGET = $(BUILD_DIR)/program
@@ -40,7 +40,7 @@ debug: all
 
 asan: CFLAGS = $(ASAN_CFLAGS)
 asan: LDFLAGS = $(ASAN_LDFLAGS)
-asan: TARGET = $(BUILD_DIR)/cli-asan
+asan: TARGET = $(BUILD_DIR)/program-asan
 asan: clean-objs $(TARGET)
 	@echo "Built with AddressSanitizer: $(TARGET)"
 

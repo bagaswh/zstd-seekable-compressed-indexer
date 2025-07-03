@@ -27,63 +27,59 @@ void print_progress(long long current, long long total) {
 	}
 }
 
-void generate_random_paragraph(FILE* fp, long long line_num) {
-	int sentence_count = 3 + (rand() % 5);  // 3-7 sentences per paragraph
+void generate_random_line(FILE* fp, long long line_num) {
+	// Generate a single line with random content
+	int sentence_idx = rand() % (sizeof(sentences) / sizeof(sentences[0]));
+	fprintf(fp, sentences[sentence_idx], line_num);
 
-	for (int i = 0; i < sentence_count; i++) {
-		int sentence_idx = rand() % (sizeof(sentences) / sizeof(sentences[0]));
-		fprintf(fp, sentences[sentence_idx], line_num);
-		fprintf(fp, " ");
-
-		// Add some random words
-		int word_count = 5 + (rand() % 10);  // 5-14 additional words
-		for (int j = 0; j < word_count; j++) {
-			int word_idx = rand() % (sizeof(words) / sizeof(words[0]));
-			fprintf(fp, "%s ", words[word_idx]);
-		}
+	// Add some random words to make each line unique
+	int word_count = 3 + (rand() % 8);  // 3-10 additional words
+	for (int j = 0; j < word_count; j++) {
+		int word_idx = rand() % (sizeof(words) / sizeof(words[0]));
+		fprintf(fp, " %s", words[word_idx]);
 	}
-	fprintf(fp, "\n\n");
+	fprintf(fp, "\n");
 }
 
-void generate_structured_content(FILE* fp, long long line_num) {
+void generate_structured_line(FILE* fp, long long line_num) {
 	// Generate different types of content based on line number
-	int content_type = line_num % 5;
+	int content_type = line_num % 8;
 
 	switch (content_type) {
 	case 0:  // Header section
-		fprintf(fp, "=== SECTION %lld: DATA PROCESSING ===\n", line_num / 1000);
-		fprintf(fp, "Timestamp: %ld\n", time(NULL));
-		fprintf(fp, "Processing large datasets requires efficient algorithms.\n\n");
+		fprintf(fp, "=== SECTION %lld: DATA PROCESSING === Timestamp: %ld\n", line_num / 1000, time(NULL));
 		break;
 
-	case 1:  // Code-like content
-		fprintf(fp, "function processData_%lld() {\n", line_num);
-		fprintf(fp, "    var result = [];\n");
-		fprintf(fp, "    for (var i = 0; i < %lld; i++) {\n", line_num % 1000);
-		fprintf(fp, "        result.push(computeValue(i));\n");
-		fprintf(fp, "    }\n");
-		fprintf(fp, "    return result;\n");
-		fprintf(fp, "}\n\n");
+	case 1:  // Code-like content - function definition
+		fprintf(fp, "function processData_%lld() { var result = []; return computeValue(%lld); }\n", line_num, line_num % 1000);
 		break;
 
-	case 2:  // Data table
-		fprintf(fp, "ID\tNAME\tVALUE\tTIMESTAMP\n");
-		for (int i = 0; i < 5; i++) {
-			fprintf(fp, "%lld\tRecord_%d\t%.2f\t%ld\n",
-			        line_num + i, i, (double)(rand() % 10000) / 100.0, time(NULL));
-		}
-		fprintf(fp, "\n");
+	case 2:  // Code-like content - loop
+		fprintf(fp, "for (var i = 0; i < %lld; i++) { result.push(computeValue(i + %lld)); }\n", line_num % 100, line_num);
 		break;
 
-	case 3:  // Log entries
-		fprintf(fp, "[%ld] INFO: Processing line %lld\n", time(NULL), line_num);
-		fprintf(fp, "[%ld] DEBUG: Memory usage: %d MB\n", time(NULL), rand() % 1024);
-		fprintf(fp, "[%ld] WARN: Large file generation in progress\n", time(NULL));
-		fprintf(fp, "\n");
+	case 3:  // Data table entry
+		fprintf(fp, "ID:%lld\tNAME:Record_%lld\tVALUE:%.2f\tTIMESTAMP:%ld\n",
+		        line_num, line_num % 1000, (double)(rand() % 10000) / 100.0, time(NULL));
 		break;
 
-	case 4:  // Narrative text
-		generate_random_paragraph(fp, line_num);
+	case 4:  // Log entries
+		fprintf(fp, "[%ld] INFO: Processing line %lld with status: %s\n",
+		        time(NULL), line_num, (line_num % 3 == 0) ? "SUCCESS" : "PENDING");
+		break;
+
+	case 5:  // System information
+		fprintf(fp, "SYSTEM: Memory usage %d MB, CPU load %.1f%%, Line %lld processed\n",
+		        rand() % 1024, (double)(rand() % 100), line_num);
+		break;
+
+	case 6:  // Configuration entries
+		fprintf(fp, "CONFIG: parameter_%lld = %d, buffer_size = %d, enabled = %s\n",
+		        line_num % 100, rand() % 256, 1024 + (rand() % 1024), (line_num % 2 == 0) ? "true" : "false");
+		break;
+
+	case 7:  // Narrative text - single line
+		generate_random_line(fp, line_num);
 		break;
 	}
 }
@@ -126,20 +122,18 @@ int main(int argc, char* argv[]) {
 	// Seed random number generator
 	srand(time(NULL));
 
-	// Write file header
-	fprintf(fp, "HUMONGOUS READABLE FILE\n");
-	fprintf(fp, "Generated on: %s", ctime(&(time_t){time(NULL)}));
-	fprintf(fp, "Target lines: %lld\n", target_lines);
-	fprintf(fp, "Content type: %s\n\n", structured ? "Structured" : "Random");
+	// Write file header (single line)
+	fprintf(fp, "HUMONGOUS READABLE FILE - Generated on: %ld - Target lines: %lld - Content type: %s\n",
+	        time(NULL), target_lines, structured ? "Structured" : "Random");
 
-	// Generate content
+	// Generate content - exactly one line per iteration
 	clock_t start_time = clock();
 
 	for (long long line = 1; line <= target_lines; line++) {
 		if (structured) {
-			generate_structured_content(fp, line);
+			generate_structured_line(fp, line);
 		} else {
-			generate_random_paragraph(fp, line);
+			generate_random_line(fp, line);
 		}
 
 		print_progress(line, target_lines);
@@ -150,10 +144,9 @@ int main(int argc, char* argv[]) {
 		}
 	}
 
-	// Write file footer
-	fprintf(fp, "END OF HUMONGOUS FILE\n");
-	fprintf(fp, "Total lines generated: %lld\n", target_lines);
-	fprintf(fp, "Generation completed at: %s", ctime(&(time_t){time(NULL)}));
+	// Write file footer (single line)
+	fprintf(fp, "END OF HUMONGOUS FILE - Total lines generated: %lld - Generation completed at: %ld\n",
+	        target_lines, time(NULL));
 
 	fclose(fp);
 

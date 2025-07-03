@@ -2,6 +2,7 @@
 #include <argp.h>
 #include <errno.h>
 #include <error.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,9 +17,11 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef int64_t i64;
 
 int compress_main(int argc, char **argv);
 int info_main(int argc, char **argv);
+int build_index_main(int argc, char **argv);
 
 struct subcommand {
 	const char *name;
@@ -28,6 +31,7 @@ struct subcommand {
 
 static struct subcommand subcommands[] = {
     {"compress", compress_main, "Compress files"},
+    {"build-index", build_index_main, "Build line index"},
     // {"decompress", decompress_main, "Decompress files"},
     {"info", info_main, "Show file information"},
     {NULL, NULL, NULL}};
@@ -58,6 +62,7 @@ typedef enum {
 	ERROR_malloc = 8,
 	ERROR_largeFile = 9,
 	ERROR_fflush = 10,
+	ERROR_mmap = 11,
 } COMMON_ErrorCode;
 
 #define CHECK(cond, ...)                        \
@@ -80,12 +85,28 @@ typedef enum {
 		CHECK(!ZSTD_isError(err), "%s", ZSTD_getErrorName(err)); \
 	} while (0)
 
+u8 *mmap_or_die(FILE *file, size_t size) {
+	u8 *const data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fileno(file), 0);
+	if (data == MAP_FAILED) {
+		perror("mmap");
+		exit(ERROR_mmap);
+	}
+	return data;
+}
+
 FILE *fopen_orDie(const char *filename, const char *instruction) {
 	FILE *const inFile = fopen(filename, instruction);
 	if (inFile) return inFile;
 	/* error */
 	perror(filename);
 	exit(ERROR_fopen);
+}
+
+static size_t fclose_orDie(FILE *file) {
+	if (!fclose(file)) return 0;
+	/* error */
+	perror("fclose");
+	exit(6);
 }
 
 size_t fread_orDie(void *buffer, size_t sizeToRead, FILE *file) {
@@ -262,46 +283,95 @@ struct seek_table_entry {
 	u32 compressed_size;
 	u32 decompressed_size;
 	u32 checksum;
+
+	u64 compressed_end_offset;
+	u64 decompressed_end_offset;
+};
+
+struct seek_table {
+	u32 footer_magic;
+	u32 num_of_frames;
+	u8 seek_table_descriptor;
+	u32 entry_size;
+	u8 checksum_flag;
+	struct seek_table_entry *entries;
 };
 
 #define ZSTD_MAGICNUMBER 0xFD2FB528
 #define ZSTD_SEEKABLE_MAGICNUMBER 0x8F92EAB1
 #define ZSTD_SEEKTABLE_FOOTER_SIZE 9
 
-void zstd_seekable_print_info(u8 *data, size_t file_size) {
+struct seek_table *load_seek_table(u8 *data, size_t file_size, struct seek_table *table) {
 	u8 *footer_ptr = data + file_size - ZSTD_SEEKTABLE_FOOTER_SIZE;
 
 	u32 footer_magic;
 	memcpy(&footer_magic, footer_ptr + 5, sizeof(u32));
 	if (footer_magic != ZSTD_SEEKABLE_MAGICNUMBER) {
 		fprintf(stderr, "Invalid footer magic number, got: %x\n", footer_magic);
-		return;
+		return NULL;
 	}
+	table->footer_magic = footer_magic;
 
 	u32 num_of_frames;
 	memcpy(&num_of_frames, footer_ptr, sizeof(u32));
-	printf("Number of frames: %d\n", num_of_frames);
+	table->num_of_frames = num_of_frames;
+	table->entries = malloc(sizeof(struct seek_table_entry) * num_of_frames);
+	if (table->entries == NULL) {
+		fprintf(stderr, "malloc() table->entries failed!\n");
+		return NULL;
+	}
 
 	u8 seek_table_descriptor;
 	memcpy(&seek_table_descriptor, footer_ptr + 4, sizeof(u8));
+	table->seek_table_descriptor = seek_table_descriptor;
 
 	u32 entry_size = 8;
 
 	u8 checksum_flag = (seek_table_descriptor >> 7) & 0x1;
 	if (checksum_flag) {
-		printf("Checksum: enabled\n");
 		entry_size += 4;
 	}
+	table->entry_size = entry_size;
+	table->checksum_flag = checksum_flag;
 
-	// u8 *seek_table_ptr = footer_ptr - (entry_size * num_of_frames);
-	// struct seek_table_entry *entry = malloc(sizeof(struct seek_table_entry));
-	// memset(entry, 0, sizeof(struct seek_table_entry));
-	// for (int i = 0; i < num_of_frames; i++) {
-	// 	memcpy(entry, seek_table_ptr + i * entry_size, entry_size);
-	// 	printf("Frame %d: compressed_size: %d, decompressed_size: %d, checksum: %x\n", i, entry->compressed_size, entry->decompressed_size, entry->checksum);
-	// }
+	u8 *seek_table_ptr = footer_ptr - (entry_size * num_of_frames);
+	u64 last_compressed_offset = 0;
+	u64 last_decompressed_offset = 0;
+	for (int i = 0; i < num_of_frames; i++) {
+		memcpy(&(table->entries[i]), seek_table_ptr + i * entry_size, entry_size);
+		last_compressed_offset += table->entries[i].compressed_size;
+		last_decompressed_offset += table->entries[i].decompressed_size;
+		(&(table->entries[i]))->compressed_end_offset = last_compressed_offset;
+		(&(table->entries[i]))->decompressed_end_offset = last_decompressed_offset;
+	}
 
-	// free(entry);
+	return table;
+}
+
+struct print_info_args {
+	bool print_seek_table;
+	bool print_frames_list;
+};
+
+void zstd_seekable_print_info(u8 *data, size_t file_size, struct print_info_args args) {
+	struct seek_table table;
+	if (!load_seek_table(data, file_size, &table)) {
+		fprintf(stderr, "load_seek_table() failed!\n");
+		return;
+	}
+
+	printf("Number of frames: %d\n", table.num_of_frames);
+
+	if (table.checksum_flag) {
+		printf("Checksum: enabled\n");
+	}
+
+	if (args.print_seek_table) {
+		for (int i = 0; i < table.num_of_frames; i++) {
+			struct seek_table_entry entry = table.entries[i];
+			printf("Frame %d: compressed_size: %d, decompressed_size: %d (c_end_offset: %ld; d_end_offset: %ld), checksum: %x\n", i, entry.compressed_size, entry.decompressed_size, entry.compressed_end_offset, entry.decompressed_end_offset, entry.checksum);
+		}
+	}
 }
 
 void stringify_bits(u8 byte, char *result) {
@@ -323,7 +393,6 @@ void print_frame(u8 *ptr) {
 		printf("Invalid magic number\n");
 		return;
 	}
-	printf("Magic: %x\n", magic);
 
 	/* Frame header */
 
@@ -388,7 +457,7 @@ void print_frame(u8 *ptr) {
 		}
 		offset += fcs_bytes;
 
-		printf("Frame content size: %ld\n", frame_content_size);
+		printf("Frame content size (decompressed): %ld\n", frame_content_size);
 	} else {
 		printf("Frame content size: not present\n");
 	}
@@ -404,14 +473,18 @@ int info_main(int argc, char **argv) {
 	char *infile = NULL;
 	char *outfile = NULL;
 
+	struct print_info_args args = {.print_seek_table = false, .print_frames_list = false};
+
 	static struct option long_options[] = {
 	    {"infile", required_argument, 0, 'i'},
 	    {"outfile", required_argument, 0, 'o'},
+	    {"print-seek-table", no_argument, 0, 's'},
+	    {"print-frames-list", no_argument, 0, 'f'},
 	    {"help", no_argument, 0, 'h'},
 	    {0, 0, 0, 0}};
 
 	while (1) {
-		int c = getopt_long(argc, argv, "i:o:l:s:vh", long_options, NULL);
+		int c = getopt_long(argc, argv, "i:o:l:s:f:vh", long_options, NULL);
 		if (c == -1) break;
 
 		switch (c) {
@@ -420,6 +493,12 @@ int info_main(int argc, char **argv) {
 			break;
 		case 'o':
 			outfile = optarg;
+			break;
+		case 's':
+			args.print_seek_table = true;
+			break;
+		case 'f':
+			args.print_frames_list = true;
 			break;
 		case 'h':
 			printf("Usage: %s [options]\n", argv[0]);
@@ -457,7 +536,118 @@ int info_main(int argc, char **argv) {
 
 	// Print seektable entries
 	printf("--- Seektable ---\n");
-	zstd_seekable_print_info(ptr, st.st_size);
+	zstd_seekable_print_info(ptr, st.st_size, args);
+
+	return 0;
+}
+
+int process_frame(void *buf, size_t buf_size, int *frames, int num_of_frames, size_t start_offset, size_t end_offset) {}
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+int decompress_frame(ZSTD_seekable *seekable, void *buf_out, size_t buf_out_size, size_t start_offset, size_t end_offset) {
+	size_t const result = ZSTD_seekable_decompress(seekable, buf_out, MIN(end_offset - start_offset, buf_out_size), end_offset);
+	if (ZSTD_isError(result)) {
+		fprintf(stderr, "ZSTD_seekable_decompress() error : %s \n",
+		        ZSTD_getErrorName(result));
+		exit(12);
+	}
+	return result;
+}
+
+int build_index_main(int argc, char **argv) {
+	char *infile = NULL;
+	char *outfile = NULL;
+
+	static struct option long_options[] = {
+	    {"infile", required_argument, 0, 'i'},
+	    {"outfile", required_argument, 0, 'o'},
+	    {"help", no_argument, 0, 'h'},
+	    {0, 0, 0, 0}};
+
+	while (1) {
+		int c = getopt_long(argc, argv, "i:o:l:s:vh", long_options, NULL);
+		if (c == -1) break;
+
+		switch (c) {
+		case 'i':
+			infile = optarg;
+			break;
+		case 'o':
+			outfile = optarg;
+			break;
+		case 'h':
+			printf("Usage: %s [options]\n", argv[0]);
+			printf("Options:\n");
+			printf("  -i, --infile FILE     Compressed file to build the index from\n");
+			printf("  -o, --outfile FILE    Index file output\n");
+			printf("  -h, --help            Show this help\n");
+			return 0;
+		case '?':
+			return 1;
+		}
+	}
+
+	if (infile) printf("Compressed file: %s\n", infile);
+	if (outfile) printf("Output file: %s\n", outfile);
+
+	FILE *in = infile ? fopen_orDie(infile, "rb") : stdin;
+	struct stat st;
+	if (fstat(fileno(in), &st) != 0) {
+		printf("Failed to stat file: %s\n", strerror(errno));
+		return 1;
+	}
+
+	ZSTD_seekable *const seekable = ZSTD_seekable_create();
+	if (seekable == NULL) {
+		fprintf(stderr, "ZSTD_seekable_create() error \n");
+		exit(10);
+	}
+
+	u8 *data = infile ? mmap_or_die(in, st.st_size) : NULL;
+	size_t const zstd_init_buf_ret = ZSTD_seekable_initBuff(seekable, data, st.st_size);
+	if (ZSTD_isError(zstd_init_buf_ret)) {
+		fprintf(stderr, "ZSTD_seekable_init() error : %s \n", ZSTD_getErrorName(zstd_init_buf_ret));
+		exit(11);
+	}
+
+	FILE *out = outfile ? fopen_orDie(outfile, "wb") : stdout;
+
+	size_t const buff_in_size = ZSTD_DStreamInSize();
+	void *buf_in = malloc_orDie(buff_in_size);
+	size_t const buf_out_size = ZSTD_DStreamOutSize(); /* Guarantee to successfully flush at least one complete compressed block in all circumstances. */
+	void *const buf_out = malloc_orDie(buf_out_size);
+
+	struct seek_table table;
+	if (!load_seek_table(data, st.st_size, &table)) {
+		fprintf(stderr, "load_seek_table() failed!\n");
+		return 1;
+	}
+
+	for (int i = 0; i < table.num_of_frames; i++) {
+		struct seek_table_entry entry = table.entries[i];
+		size_t start_off = entry.compressed_end_offset - entry.compressed_size;
+		size_t end_off = entry.compressed_end_offset;
+		while (start_off < end_off) {
+			size_t const result = ZSTD_seekable_decompress(seekable, buf_out, MIN(end_off - start_off, buf_out_size), start_off);
+			if (!result) {
+				break;
+			}
+			if (ZSTD_isError(result)) {
+				fprintf(stderr, "ZSTD_seekable_decompress() error : %s \n",
+				        ZSTD_getErrorName(result));
+				exit(12);
+			}
+			fwrite_orDie(buf_out, result, stdout);
+			start_off += result;
+		}
+	}
+
+	ZSTD_seekable_free(seekable);
+	fclose_orDie(in);
+	fclose_orDie(out);
+	free(buf_in);
+	free(buf_out);
 
 	return 0;
 }
