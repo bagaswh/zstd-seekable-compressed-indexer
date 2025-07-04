@@ -1,4 +1,5 @@
 *.txt
-*.zst
+*.zst*
 genfile
 main
+*.bin
