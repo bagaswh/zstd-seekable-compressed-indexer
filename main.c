@@ -21,7 +21,9 @@ typedef int64_t i64;
 
 int compress_main(int argc, char **argv);
 int info_main(int argc, char **argv);
-int build_index_main(int argc, char **argv);
+int write_pairs_main(int argc, char **argv);
+int print_offset_content_pair(int argc, char **argv);
+int decompress_frame_main(int argc, char **argv);
 
 struct subcommand {
 	const char *name;
@@ -31,8 +33,10 @@ struct subcommand {
 
 static struct subcommand subcommands[] = {
     {"compress", compress_main, "Compress files"},
-    {"build-index", build_index_main, "Build line index"},
+    {"write-pairs", write_pairs_main, "Write pairs"},
+    {"print-offset-content-pair", print_offset_content_pair, "Print offset content pairs from stdin"},
     // {"decompress", decompress_main, "Decompress files"},
+    {"decompress-frame", decompress_frame_main, "Decompress frame"},
     {"info", info_main, "Show file information"},
     {NULL, NULL, NULL}};
 
@@ -142,6 +146,15 @@ void *malloc_orDie(size_t size) {
 		return buff;
 	/* error */
 	perror("malloc");
+	exit(ERROR_malloc);
+}
+
+void *realloc_orDie(void *ptr, size_t size) {
+	void *new_ptr = realloc(ptr, size);
+	if (new_ptr)
+		return new_ptr;
+	/* error */
+	perror("realloc");
 	exit(ERROR_malloc);
 }
 
@@ -369,7 +382,12 @@ void zstd_seekable_print_info(u8 *data, size_t file_size, struct print_info_args
 	if (args.print_seek_table) {
 		for (int i = 0; i < table.num_of_frames; i++) {
 			struct seek_table_entry entry = table.entries[i];
-			printf("Frame %d: compressed_size: %d, decompressed_size: %d (c_end_offset: %ld; d_end_offset: %ld), checksum: %x\n", i, entry.compressed_size, entry.decompressed_size, entry.compressed_end_offset, entry.decompressed_end_offset, entry.checksum);
+			size_t c_start_off = entry.compressed_end_offset - entry.compressed_size;
+			size_t c_end_off = entry.compressed_end_offset;
+			size_t d_start_off = entry.decompressed_end_offset - entry.decompressed_size;
+			size_t d_end_off = entry.decompressed_end_offset;
+			printf("Frame %d: (coffset: %ld - %ld, %ld bytes); (doffset: %ld - %ld, %ld bytes), checksum: %x\n",
+			       i, c_start_off, c_end_off, c_end_off - c_start_off, d_start_off, d_end_off, d_end_off - d_start_off, entry.checksum);
 		}
 	}
 }
@@ -555,7 +573,137 @@ int decompress_frame(ZSTD_seekable *seekable, void *buf_out, size_t buf_out_size
 	return result;
 }
 
-int build_index_main(int argc, char **argv) {
+int decompress_frame_main(int argc, char **argv) {
+	char *infile = NULL;
+	char *outfile = NULL;
+	size_t frame_index = 0;
+	size_t start_offset = 0;
+	size_t end_offset = 0;
+
+	static struct option long_options[] = {
+	    {"infile", required_argument, 0, 'i'},
+	    {"outfile", required_argument, 0, 'o'},
+	    {"frame-index", required_argument, 0, 'f'},
+	    {"start-offset", required_argument, 0, 's'},
+	    {"end-offset", required_argument, 0, 'e'},
+	    {"help", no_argument, 0, 'h'},
+	    {0, 0, 0, 0}};
+
+	while (1) {
+		int c = getopt_long(argc, argv, "i:o:f:s:e:vh", long_options, NULL);
+		if (c == -1) break;
+
+		switch (c) {
+		case 'i':
+			infile = optarg;
+			break;
+		case 'o':
+			outfile = optarg;
+			break;
+		case 'f':
+			frame_index = atoi(optarg);
+			break;
+		case 's':
+			start_offset = atoi(optarg);
+			break;
+		case 'e':
+			end_offset = atoi(optarg);
+			break;
+		case 'h':
+			printf("Usage: %s [options]\n", argv[0]);
+			printf("Options:\n");
+			printf("  -i, --infile FILE     Input file (default: stdin)\n");
+			printf("  -o, --outfile FILE    Output file (default: stdout)\n");
+			printf("  -f, --frame-index INT Frame index\n");
+			printf("  -s, --start-offset INT Start offset\n");
+			printf("  -e, --end-offset INT End offset\n");
+			printf("  -h, --help            Show this help\n");
+			return 0;
+		case '?':
+			return 1;
+		}
+	}
+
+	if (frame_index == 0 && start_offset == 0 && end_offset == 0) {
+		printf("Please specify at least one of the following options: --frame-index, --start-offset, --end-offset\n");
+		return 1;
+	}
+
+	FILE *in = infile ? fopen_orDie(infile, "rb") : stdin;
+	struct stat st;
+	if (fstat(fileno(in), &st) != 0) {
+		printf("Failed to stat file: %s\n", strerror(errno));
+		return 1;
+	}
+
+	ZSTD_seekable *const seekable = ZSTD_seekable_create();
+	if (seekable == NULL) {
+		fprintf(stderr, "ZSTD_seekable_create() error \n");
+		exit(10);
+	}
+
+	u8 *data = infile ? mmap_or_die(in, st.st_size) : NULL;
+	size_t const zstd_init_buf_ret = ZSTD_seekable_initBuff(seekable, data, st.st_size);
+	if (ZSTD_isError(zstd_init_buf_ret)) {
+		fprintf(stderr, "ZSTD_seekable_init() error : %s \n", ZSTD_getErrorName(zstd_init_buf_ret));
+		exit(11);
+	}
+
+	FILE *out = outfile ? fopen_orDie(outfile, "wb") : stdout;
+
+	size_t const buff_in_size = ZSTD_DStreamInSize();
+	void *buf_in = malloc_orDie(buff_in_size);
+	struct seek_table table;
+	if (!load_seek_table(data, st.st_size, &table)) {
+		fprintf(stderr, "load_seek_table() failed!\n");
+		return 1;
+	}
+
+	if (frame_index != 0 && frame_index < table.num_of_frames) {
+		struct seek_table_entry entry = table.entries[frame_index];
+		size_t start_off = entry.decompressed_end_offset - entry.decompressed_size;
+		size_t end_off = entry.decompressed_end_offset;
+		char *buf_out = malloc(end_off - start_off);
+		if (buf_out == NULL) {
+			fprintf(stderr, "malloc() buf_out failed!\n");
+			return 1;
+		}
+		while (start_off < end_off) {
+			size_t const result = ZSTD_seekable_decompress(seekable, buf_out, end_off - start_off, start_off);
+			if (!result) {
+				break;
+			}
+			if (ZSTD_isError(result)) {
+				fprintf(stderr, "ZSTD_seekable_decompress() error : %s \n",
+				        ZSTD_getErrorName(result));
+				exit(12);
+			}
+			fwrite_orDie(buf_out, result, stdout);
+			start_off += result;
+		}
+	} else if (frame_index != 0) {
+		fprintf(stderr, "Invalid frame index: %d\n", frame_index);
+		return 1;
+	}
+}
+
+#define OFFSET_CONTENT_PAIR_MAGIC 0x9143DCA8
+
+struct __attribute__((packed)) offset_content_pair {
+	u32 magic;
+	u64 content_length;
+
+	u64 frame_index;
+
+	u64 compressed_start_offset;
+	u64 decompressed_start_offset;
+	u64 compressed_end_offset;
+	u64 decompressed_end_offset;
+
+	char content[];
+};
+
+int write_pairs_main(int argc, char **argv) {
 	char *infile = NULL;
 	char *outfile = NULL;
 
@@ -588,9 +736,6 @@ int build_index_main(int argc, char **argv) {
 		}
 	}
 
-	if (infile) printf("Compressed file: %s\n", infile);
-	if (outfile) printf("Output file: %s\n", outfile);
-
 	FILE *in = infile ? fopen_orDie(infile, "rb") : stdin;
 	struct stat st;
 	if (fstat(fileno(in), &st) != 0) {
@@ -615,21 +760,33 @@ int build_index_main(int argc, char **argv) {
 
 	size_t const buff_in_size = ZSTD_DStreamInSize();
 	void *buf_in = malloc_orDie(buff_in_size);
-	size_t const buf_out_size = ZSTD_DStreamOutSize(); /* Guarantee to successfully flush at least one complete compressed block in all circumstances. */
-	void *const buf_out = malloc_orDie(buf_out_size);
-
 	struct seek_table table;
 	if (!load_seek_table(data, st.st_size, &table)) {
 		fprintf(stderr, "load_seek_table() failed!\n");
 		return 1;
 	}
 
+	size_t const buf_out_size = ZSTD_DStreamOutSize();
+	struct offset_content_pair *pair = malloc(sizeof(struct offset_content_pair) + buf_out_size);
+	if (pair == NULL) {
+		fprintf(stderr, "malloc() pair failed!\n");
+		return 1;
+	}
+
+	pair->magic = OFFSET_CONTENT_PAIR_MAGIC;
 	for (int i = 0; i < table.num_of_frames; i++) {
+		pair->frame_index = i;
+		pair->compressed_start_offset = table.entries[i].compressed_end_offset - table.entries[i].compressed_size;
+		pair->compressed_end_offset = table.entries[i].compressed_end_offset;
+
+		pair->decompressed_start_offset = table.entries[i].decompressed_end_offset - table.entries[i].decompressed_size;
+		pair->decompressed_end_offset = table.entries[i].decompressed_end_offset;
+
 		struct seek_table_entry entry = table.entries[i];
-		size_t start_off = entry.compressed_end_offset - entry.compressed_size;
-		size_t end_off = entry.compressed_end_offset;
+		size_t start_off = entry.decompressed_end_offset - entry.decompressed_size;
+		size_t end_off = entry.decompressed_end_offset;
 		while (start_off < end_off) {
-			size_t const result = ZSTD_seekable_decompress(seekable, buf_out, MIN(end_off - start_off, buf_out_size), start_off);
+			size_t const result = ZSTD_seekable_decompress(seekable, &(pair->content), MIN(end_off - start_off, buf_out_size), start_off);
 			if (!result) {
 				break;
 			}
@@ -638,7 +795,8 @@ int build_index_main(int argc, char **argv) {
 				        ZSTD_getErrorName(result));
 				exit(12);
 			}
-			fwrite_orDie(buf_out, result, stdout);
+			pair->content_length = result;
+			fwrite_orDie(pair, sizeof(struct offset_content_pair) + pair->content_length, stdout);
 			start_off += result;
 		}
 	}
@@ -647,7 +805,349 @@ int build_index_main(int argc, char **argv) {
 	fclose_orDie(in);
 	fclose_orDie(out);
 	free(buf_in);
-	free(buf_out);
+	free(pair);
 
+	return 0;
+}
+
+// Implement streaming read.
+int print_offset_content_pair_broken(int argc, char **argv) {
+	char *infile = NULL;
+	char *outfile = NULL;
+
+	static struct option long_options[] = {
+	    {"infile", required_argument, 0, 'i'},
+	    {"help", no_argument, 0, 'h'},
+	    {0, 0, 0, 0}};
+
+	while (1) {
+		int c = getopt_long(argc, argv, "i:vh", long_options, NULL);
+		if (c == -1) break;
+
+		switch (c) {
+		case 'i':
+			infile = optarg;
+			break;
+		case 'h':
+			printf("Usage: %s [options]\n", argv[0]);
+			printf("Options:\n");
+			printf("  -i, --infile FILE     Compressed file to build the index from\n");
+			printf("  -h, --help            Show this help\n");
+			return 0;
+		case '?':
+			return 1;
+		}
+	}
+
+	FILE *fin = infile ? fopen_orDie(infile, "rb") : stdin;
+	size_t buf_size = 1024;
+	// if (fin != stdin) {
+	//     struct stat st;
+	//     if (fstat(fileno(fin), &st) != 0) {
+	//         printf("Failed to stat file: %s\n", strerror(errno));
+	//         return 1;
+	//     }
+	//     buf_size = st.st_size;
+	// }
+	char *buf = malloc(buf_size);
+	if (buf == NULL) {
+		fprintf(stderr, "malloc() buf failed!\n");
+		return 1;
+	}
+	char *bufptr = buf;
+	ssize_t read = 0;
+	size_t prev_content_read_remaining = 0;
+	bool prev_hdr_incomplete = false;
+	size_t prev_hdr_remaining = 0;
+	void *hdr_buf = malloc(sizeof(struct offset_content_pair));
+	if (hdr_buf == NULL) {
+		fprintf(stderr, "malloc() hdr_buf failed!\n");
+		return 1;
+	}
+	u64 frame_count = 0;
+	while ((read = fread_orDie(buf, buf_size, fin))) {
+		bufptr = buf;
+		while (read > 0) {
+			if (prev_hdr_incomplete) {
+				printf("print_hdr_incomplete\n");
+				size_t copy_start_offset = sizeof(struct offset_content_pair) - prev_hdr_remaining;
+				if (read >= prev_hdr_remaining) {
+					printf("read >= prev_hdr_remaining\n");
+					memcpy(hdr_buf + copy_start_offset, bufptr, prev_hdr_remaining);
+					bufptr += prev_hdr_remaining;
+					read -= prev_hdr_remaining;
+					prev_hdr_incomplete = false;
+				} else {
+					printf("read < prev_hdr_remaining\n");
+					memcpy(hdr_buf + copy_start_offset, bufptr, read);
+					prev_hdr_remaining -= read;
+					read = 0;
+					continue;
+				}
+			} else {
+				if (prev_content_read_remaining > 0) {
+					printf("prev_content_read_remaining > 0\n");
+
+					if (prev_content_read_remaining <= read) {
+						printf("prev_content_read_remaining <= read\n");
+						// fwrite(bufptr, 1, prev_content_read_remaining, stdout);
+						bufptr += prev_content_read_remaining;
+						read -= prev_content_read_remaining;
+						prev_content_read_remaining = 0;
+					} else {
+						printf("prev_content_read_remaining > read\n");
+						// fwrite(bufptr, 1, read, stdout);
+						prev_content_read_remaining -= read;
+						continue;
+					}
+				}
+
+				// Tries to find magic number
+				u32 magic = 0;
+				do {
+					memcpy(&magic, bufptr, sizeof(u32));
+					if (magic == OFFSET_CONTENT_PAIR_MAGIC) {
+						frame_count++;
+						bufptr += sizeof(u32);
+						read -= sizeof(u32);
+						break;
+					}
+					bufptr++;
+					read--;
+				} while (read > 0);
+
+				// buffer exhausted but still haven't found magic number
+				// TODO: implement partial magic number handling
+				if (magic != OFFSET_CONTENT_PAIR_MAGIC) {
+					printf("read == 0 && magic != OFFSET_CONTENT_PAIR_MAGIC\n");
+					continue;
+				}
+
+				if (read >= sizeof(struct offset_content_pair)) {
+					printf("read >= sizeof(struct offset_content_pair)\n");
+					prev_hdr_incomplete = false;
+					struct offset_content_pair *pair = (struct offset_content_pair *)(bufptr - 4);
+					bufptr += (sizeof(struct offset_content_pair) - sizeof(u32));
+					read -= (sizeof(struct offset_content_pair) - sizeof(u32));
+					if (read < pair->content_length) {
+						printf("raed < pair->content_length\n");
+						// fwrite(bufptr, 1, read, stdout);
+						prev_content_read_remaining = pair->content_length - read;
+						read = 0;
+						continue;
+					} else {
+						printf("read >= pair->content_length\n");
+						// fwrite(bufptr, 1, pair->content_length, stdout);
+						bufptr += pair->content_length;
+						read -= pair->content_length;
+					}
+				} else {
+					printf("read < sizeof(struct offset_content_pair)\n");
+					prev_hdr_incomplete = true;
+					prev_hdr_remaining = sizeof(struct offset_content_pair) - read;
+					memcpy(hdr_buf, bufptr, read);
+					read = 0;
+				}
+			}
+		}
+	}
+	free(buf);
+}
+
+int print_offset_content_pair(int argc, char **argv) {
+	char *infile = NULL;
+	char *outfile = NULL;
+
+	static struct option long_options[] = {
+	    {"infile", required_argument, 0, 'i'},
+	    {"help", no_argument, 0, 'h'},
+	    {0, 0, 0, 0}};
+
+	while (1) {
+		int c = getopt_long(argc, argv, "i:vh", long_options, NULL);
+		if (c == -1) break;
+
+		switch (c) {
+		case 'i':
+			infile = optarg;
+			break;
+		case 'h':
+			printf("Usage: %s [options]\n", argv[0]);
+			printf("Options:\n");
+			printf("  -i, --infile FILE     Compressed file to build the index from\n");
+			printf("  -h, --help            Show this help\n");
+			return 0;
+		case '?':
+			return 1;
+		}
+	}
+
+	FILE *fin = infile ? fopen_orDie(infile, "rb") : stdin;
+	size_t buf_size = 1024;
+	char *buf = malloc(buf_size);
+	if (buf == NULL) {
+		fprintf(stderr, "malloc() buf failed!\n");
+		if (fin != stdin) fclose(fin);
+		return 1;
+	}
+
+	char *bufptr = buf;
+	ssize_t read = 0;
+	size_t prev_content_read_remaining = 0;
+	bool prev_hdr_incomplete = false;
+	size_t prev_hdr_remaining = 0;
+	void *hdr_buf = malloc(sizeof(struct offset_content_pair));
+	if (hdr_buf == NULL) {
+		fprintf(stderr, "malloc() hdr_buf failed!\n");
+		free(buf);
+		if (fin != stdin) fclose(fin);
+		return 1;
+	}
+
+	u32 partial_magic = 0;
+	int partial_magic_bytes = 0;
+
+	u64 frame_count = 0;
+
+	while ((read = fread_orDie(buf, buf_size, fin))) {
+		bufptr = buf;
+
+		while (read > 0) {
+			if (prev_hdr_incomplete) {
+				size_t copy_start_offset = sizeof(struct offset_content_pair) - prev_hdr_remaining;
+				if (read >= prev_hdr_remaining) {
+					memcpy(hdr_buf + copy_start_offset, bufptr, prev_hdr_remaining);
+					bufptr += prev_hdr_remaining;
+					read -= prev_hdr_remaining;
+					prev_hdr_incomplete = false;
+
+					struct offset_content_pair *pair = (struct offset_content_pair *)hdr_buf;
+
+					if (pair->content_length > 1024 * 1024 * 1024) {  // 1GB limit
+						fprintf(stderr, "Content length too large: %zu\n", pair->content_length);
+						goto cleanup;
+					}
+
+					if (read < pair->content_length) {
+						fwrite(bufptr, 1, read, stdout);
+						prev_content_read_remaining = pair->content_length - read;
+						read = 0;
+						continue;
+					} else {
+						fwrite(bufptr, 1, pair->content_length, stdout);
+						bufptr += pair->content_length;
+						read -= pair->content_length;
+					}
+				} else {
+					memcpy(hdr_buf + copy_start_offset, bufptr, read);
+					prev_hdr_remaining -= read;
+					read = 0;
+					continue;
+				}
+			} else if (prev_content_read_remaining > 0) {
+				if (prev_content_read_remaining <= read) {
+					fwrite(bufptr, 1, prev_content_read_remaining, stdout);
+					bufptr += prev_content_read_remaining;
+					read -= prev_content_read_remaining;
+					prev_content_read_remaining = 0;
+				} else {
+					fwrite(bufptr, 1, read, stdout);
+					prev_content_read_remaining -= read;
+					read = 0;
+					continue;
+				}
+			}
+
+			bool found_magic = false;
+			while (read > 0) {
+				if (partial_magic_bytes > 0) {
+					int bytes_needed = sizeof(u32) - partial_magic_bytes;
+					int bytes_available = read < bytes_needed ? read : bytes_needed;
+
+					for (int i = 0; i < bytes_available; i++) {
+						partial_magic = (partial_magic << 8) | bufptr[i];
+					}
+					partial_magic_bytes += bytes_available;
+
+					if (partial_magic_bytes == sizeof(u32)) {
+						if (partial_magic == OFFSET_CONTENT_PAIR_MAGIC) {
+							found_magic = true;
+							frame_count++;
+							bufptr += bytes_available;
+							read -= bytes_available;
+							partial_magic_bytes = 0;
+							break;
+						} else {
+							partial_magic_bytes = 0;
+						}
+					} else {
+						bufptr += bytes_available;
+						read -= bytes_available;
+						continue;
+					}
+				}
+
+				if (read >= sizeof(u32)) {
+					u32 magic;
+					memcpy(&magic, bufptr, sizeof(u32));
+					if (magic == OFFSET_CONTENT_PAIR_MAGIC) {
+						found_magic = true;
+						frame_count++;
+						bufptr += sizeof(u32);
+						read -= sizeof(u32);
+						break;
+					}
+					bufptr++;
+					read--;
+				} else {
+					partial_magic = 0;
+					for (int i = 0; i < read; i++) {
+						partial_magic = (partial_magic << 8) | bufptr[i];
+					}
+					partial_magic_bytes = read;
+					read = 0;
+					break;
+				}
+			}
+
+			if (!found_magic) {
+				continue;
+			}
+
+			if (read >= sizeof(struct offset_content_pair) - sizeof(u32)) {
+				struct offset_content_pair *pair = (struct offset_content_pair *)(bufptr - sizeof(u32));
+				bufptr += (sizeof(struct offset_content_pair) - sizeof(u32));
+				read -= (sizeof(struct offset_content_pair) - sizeof(u32));
+
+				if (pair->content_length > 1024 * 1024 * 1024) {  // 1GB limit
+					fprintf(stderr, "Content length too large: %zu\n", pair->content_length);
+					goto cleanup;
+				}
+
+				if (read < pair->content_length) {
+					fwrite(bufptr, 1, read, stdout);
+					prev_content_read_remaining = pair->content_length - read;
+					read = 0;
+					continue;
+				} else {
+					fwrite(bufptr, 1, pair->content_length, stdout);
+					bufptr += pair->content_length;
+					read -= pair->content_length;
+				}
+			} else {
+				prev_hdr_incomplete = true;
+				prev_hdr_remaining = sizeof(struct offset_content_pair) - sizeof(u32) - read;
+
+				memcpy(hdr_buf, bufptr - sizeof(u32), sizeof(u32));
+				memcpy(hdr_buf + sizeof(u32), bufptr, read);
+				read = 0;
+			}
+		}
+	}
+
+cleanup:
+	free(buf);
+	free(hdr_buf);
+	if (fin != stdin) fclose(fin);
 	return 0;
 }

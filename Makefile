@@ -1,7 +1,8 @@
 CC = clang
 COMMON_CFLAGS = -std=c17 -march=native
-DEBUG_CFLAGS = $(COMMON_CFLAGS) -O0 -g -DDEBUG
+DEBUG_CFLAGS = $(COMMON_CFLAGS) -O0 -g3 -gdwarf-4 -DDEBUG
 ASAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls -fno-common
+ASAN_LDFLAGS = -fsanitize=address -fsanitize=undefined
 
 BUILD_DIR = build
 TARGET = $(BUILD_DIR)/program
@@ -17,6 +18,9 @@ ZSTD_SEEKABLE_SRCS = \
 ZSTD_SEEKABLE_OBJS = $(ZSTD_SEEKABLE_SRCS:.c=.o)
 
 INCLUDES = -I$(ZSTD_LIB_DIR) -I$(ZSTD_LIB_DIR)/common -I$(ZSTD_SEEKABLE_DIR)
+
+# Valgrind configuration
+VALGRIND_OPTS = --leak-check=full --show-leak-kinds=all --track-origins=yes --verbose --error-exitcode=1
 
 all: $(TARGET)
 
@@ -64,9 +68,13 @@ run: all
 	$(TARGET)
 
 run-asan: asan
-	$(BUILD_DIR)/cli-asan
+	$(BUILD_DIR)/program-asan
 
-.PHONY: all debug asan clean clean-objs clean-all init-submodules run run-asan
+run-valgrind: debug
+	@echo "Running with Valgrind..."
+	valgrind $(VALGRIND_OPTS) $(TARGET)
+
+.PHONY: all debug asan clean clean-objs clean-all init-submodules run run-asan run-valgrind
 
 build-genfile:
 	clang -O2 -march=native -std=c17 -I. genfile.c -o genfile
