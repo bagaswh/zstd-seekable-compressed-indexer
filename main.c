@@ -840,7 +840,7 @@ int print_offset_content_pair(int argc, char **argv) {
 	}
 
 	FILE *fin = infile ? fopen_orDie(infile, "rb") : stdin;
-	size_t buf_size = 1024;
+	size_t buf_size = 10 * 1024 * 1024;
 	char *buf = malloc(buf_size);
 	if (buf == NULL) {
 		fprintf(stderr, "malloc() buf failed!\n");
