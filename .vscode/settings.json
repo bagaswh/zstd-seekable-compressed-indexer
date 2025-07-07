@@ -6,6 +6,16 @@
         "string_view": "c",
         "span": "c",
         "chrono": "c",
-        "stdlib.h": "c"
+        "stdlib.h": "c",
+        "bit": "c",
+        "functional": "c",
+        "random": "c",
+        "format": "c",
+        "istream": "c",
+        "limits": "c",
+        "numeric": "c",
+        "semaphore": "c",
+        "algorithm": "c",
+        "thread": "c"
     }
 }

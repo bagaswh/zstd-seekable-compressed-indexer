@@ -1,8 +1,12 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
+
 #include <argp.h>
 #include <errno.h>
 #include <error.h>
+#include <immintrin.h>
+#include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +26,7 @@ typedef int64_t i64;
 int compress_main(int argc, char **argv);
 int info_main(int argc, char **argv);
 int write_pairs_main(int argc, char **argv);
-int print_offset_content_pair(int argc, char **argv);
+int build_index_main(int argc, char **argv);
 int decompress_frame_main(int argc, char **argv);
 
 struct subcommand {
@@ -34,7 +38,7 @@ struct subcommand {
 static struct subcommand subcommands[] = {
     {"compress", compress_main, "Compress files"},
     {"write-pairs", write_pairs_main, "Write pairs"},
-    {"print-offset-content-pair", print_offset_content_pair, "Print offset content pairs from stdin"},
+    {"build-index", build_index_main, "Build index from streaming pairs"},
     // {"decompress", decompress_main, "Decompress files"},
     {"decompress-frame", decompress_frame_main, "Decompress frame"},
     {"info", info_main, "Show file information"},
@@ -55,6 +59,8 @@ void print_usage(const char *program_name) {
 #define ERR_ZSTD_COMPRESS 3
 
 /* Utils */
+#define max(a, b) ((a) > (b) ? (a) : (b))
+
 typedef enum {
 	ERROR_fsize = 1,
 	ERROR_fopen = 2,
@@ -559,8 +565,6 @@ int info_main(int argc, char **argv) {
 	return 0;
 }
 
-int process_frame(void *buf, size_t buf_size, int *frames, int num_of_frames, size_t start_offset, size_t end_offset) {}
-
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 int decompress_frame(ZSTD_seekable *seekable, void *buf_out, size_t buf_out_size, size_t start_offset, size_t end_offset) {
@@ -682,9 +686,11 @@ int decompress_frame_main(int argc, char **argv) {
 			start_off += result;
 		}
 	} else if (frame_index != 0) {
-		fprintf(stderr, "Invalid frame index: %d\n", frame_index);
+		fprintf(stderr, "Invalid frame index: %ld\n", frame_index);
 		return 1;
 	}
+
+	return 0;
 }
 
 #define OFFSET_CONTENT_PAIR_MAGIC 0x9143DCA8
@@ -810,8 +816,563 @@ int write_pairs_main(int argc, char **argv) {
 	return 0;
 }
 
-// Implement streaming read.
-int print_offset_content_pair(int argc, char **argv) {
+/* ---- begin CPUID ---- */
+
+// Function to execute CPUID instruction
+static inline void cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
+#ifdef _MSC_VER
+	// Microsoft Visual C++ compiler
+	int regs[4];
+	__cpuidex(regs, leaf, subleaf);
+	*eax = regs[0];
+	*ebx = regs[1];
+	*ecx = regs[2];
+	*edx = regs[3];
+#else
+	// GCC and Clang
+	__asm__ volatile("cpuid"
+	                 : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
+	                 : "a"(leaf), "c"(subleaf));
+#endif
+}
+
+// Check if CPU supports SSE4.1 and SSE4.2
+int check_sse4_support() {
+	uint32_t eax, ebx, ecx, edx;
+
+	// CPUID leaf 1: Feature Information
+	cpuid(1, 0, &eax, &ebx, &ecx, &edx);
+
+	// SSE4.1 is bit 19 of ECX, SSE4.2 is bit 20 of ECX
+	int sse4_1 = (ecx >> 19) & 1;
+	int sse4_2 = (ecx >> 20) & 1;
+
+	return sse4_1 && sse4_2;
+}
+
+// Check if CPU supports AVX
+int check_avx_support() {
+	uint32_t eax, ebx, ecx, edx;
+
+	// CPUID leaf 1: Feature Information
+	cpuid(1, 0, &eax, &ebx, &ecx, &edx);
+
+	// AVX is bit 28 of ECX
+	int avx_cpuid = (ecx >> 28) & 1;
+
+	// Also need to check if OS supports AVX (XSAVE/XRSTOR)
+	int osxsave = (ecx >> 27) & 1;
+
+	if (!avx_cpuid || !osxsave) {
+		return 0;
+	}
+
+	// Check if OS has enabled AVX support
+	uint64_t xcr0;
+#ifdef _MSC_VER
+	xcr0 = _xgetbv(0);
+#else
+	__asm__ volatile("xgetbv" : "=a"(xcr0) : "c"(0) : "edx");
+#endif
+
+	// Check if YMM state is enabled (bits 1 and 2 of XCR0)
+	return (xcr0 & 6) == 6;
+}
+
+// Check if CPU supports AVX2
+int check_avx2_support() {
+	uint32_t eax, ebx, ecx, edx;
+
+	// First check if AVX is supported
+	if (!check_avx_support()) {
+		return 0;
+	}
+
+	// CPUID leaf 7, subleaf 0: Extended Features
+	cpuid(7, 0, &eax, &ebx, &ecx, &edx);
+
+	// AVX2 is bit 5 of EBX
+	return (ebx >> 5) & 1;
+}
+
+/* ---- end CPUID ---- */
+
+#define INDEX_MAGIC 0x7EFB8DC1
+
+int index_of_newline_scalar(char *data, size_t size) {
+	if (size == 0) return -1;
+	for (size_t i = 0; i < size; i++) {
+		if (data[i] == '\n') {
+			return i;
+		}
+	}
+	return -1;
+}
+
+int index_of_newline_sse(char *data, size_t size) {
+	if (size == 0) return -1;
+
+	const __m128i newline_vec = _mm_set1_epi8('\n');
+	size_t i = 0;
+
+	// Process 16 bytes at a time
+	for (i = 0; i <= size - 16; i += 16) {
+		__m128i chunk = _mm_loadu_si128((__m128i *)(data + i));
+		__m128i cmp = _mm_cmpeq_epi8(chunk, newline_vec);
+
+		int mask = _mm_movemask_epi8(cmp);
+		if (mask != 0) {
+			// Found a newline, find the first one
+			int offset = __builtin_ctz(mask);
+			return i + offset;
+		}
+	}
+
+	// Handle remaining bytes (less than 16)
+	for (; i < size; i++) {
+		if (data[i] == '\n') {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+int index_of_newline_avx2(char *data, size_t size) {
+	if (size == 0) return -1;
+
+	const __m256i newline_vec = _mm256_set1_epi8('\n');
+	size_t i = 0;
+
+	// Process 32 bytes at a time
+	for (i = 0; i <= size - 32; i += 32) {
+		__m256i chunk = _mm256_loadu_si256((__m256i *)(data + i));
+		__m256i cmp = _mm256_cmpeq_epi8(chunk, newline_vec);
+
+		int mask = _mm256_movemask_epi8(cmp);
+		if (mask != 0) {
+			// Found a newline, find the first one
+			int offset = __builtin_ctz(mask);
+			return i + offset;
+		}
+	}
+
+	// Handle remaining bytes (less than 32)
+	for (; i < size; i++) {
+		if (data[i] == '\n') {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+int index_of_newline_avx2_aligned(char *data, size_t size) {
+	if (size == 0) return -1;
+
+	const __m256i newline_vec = _mm256_set1_epi8('\n');
+	size_t i = 0;
+
+	// Handle unaligned prefix to reach 32-byte boundary
+	uintptr_t addr = (uintptr_t)data;
+	size_t prefix_len = (32 - (addr & 31)) & 31;
+
+	if (prefix_len > 0 && prefix_len < size) {
+		for (i = 0; i < prefix_len; i++) {
+			if (data[i] == '\n') {
+				return i;
+			}
+		}
+	}
+
+	// Process 32 bytes at a time with aligned access
+	for (; i <= size - 32; i += 32) {
+		__m256i chunk;
+		if ((addr + i) & 31) {
+			chunk = _mm256_loadu_si256((__m256i *)(data + i));
+		} else {
+			chunk = _mm256_load_si256((__m256i *)(data + i));
+		}
+
+		__m256i cmp = _mm256_cmpeq_epi8(chunk, newline_vec);
+		int mask = _mm256_movemask_epi8(cmp);
+
+		if (mask != 0) {
+			int offset = __builtin_ctz(mask);
+			return i + offset;
+		}
+	}
+
+	// Handle remaining bytes
+	for (; i < size; i++) {
+		if (data[i] == '\n') {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+int index_of_newline_auto(char *data, size_t size) {
+	if (size < 32) {
+		return index_of_newline_scalar(data, size);
+	}
+	if (size < 128 && check_sse4_support()) {
+		return index_of_newline_sse(data, size);
+	}
+	if (size < 256 && check_avx2_support()) {
+		return index_of_newline_avx2(data, size);
+	}
+	return index_of_newline_scalar(data, size);
+}
+
+struct pair_parser_ctx {
+	char *data;
+	char *data_ptr;
+	size_t data_size;
+
+	void *hdr_buf;
+
+	bool prev_hdr_incomplete;
+	size_t prev_hdr_remaining;
+	size_t prev_content_read_remaining;
+	u32 partial_magic;
+	int partial_magic_bytes;
+	u64 frame_count;
+
+	void *content_buf;
+	size_t content_buf_size;
+	size_t content_buf_used;
+
+	struct pair_parser_ctx *snapshots;
+	size_t snapshots_buffer_size;
+	size_t snapshot_count;
+};
+
+void __attribute__((always_inline)) pair_parser_printf(struct pair_parser_ctx *ctx, FILE *out, char *format, ...) {
+#if DEBUG
+	va_list args;
+	char *myfmt = "[pair_parser_ctx] data_size=%zu prev_hdr_incomplete=%d prev_hdr_remaining=%zu partial_magic=%x partial_magic_bytes=%d frame_count=%ld content_buf_used=%zu content_buf_size=%zu ";
+	char *fmt = malloc(strlen(format) + strlen(myfmt) + 1);
+	strcpy(fmt, myfmt);
+	strcat(fmt, format);
+	va_start(args, format);
+	fprintf(out, myfmt,
+	        ctx->data_size,
+	        ctx->prev_hdr_incomplete,
+	        ctx->prev_hdr_remaining,
+	        ctx->partial_magic,
+	        ctx->partial_magic_bytes,
+	        ctx->frame_count,
+	        ctx->content_buf_used,
+	        ctx->content_buf_size);
+	vfprintf(out, format, args);
+	va_end(args);
+	free(fmt);
+#endif
+}
+
+void __attribute__((always_inline)) pair_parser_debug(struct pair_parser_ctx *ctx, char *format, ...) {
+#if DEBUG
+	va_list args;
+	va_start(args, format);
+	char buffer[1024];
+	vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	pair_parser_printf(ctx, stderr, "%s", buffer);
+#endif
+}
+
+struct pair_parser_ctx __attribute__((always_inline)) * snapshot_state(struct pair_parser_ctx *ctx) {
+#if false
+	if (ctx->snapshots == NULL) {
+		return NULL;
+	}
+
+	struct pair_parser_ctx *new_ctx = malloc(sizeof(struct pair_parser_ctx));
+	if (new_ctx == NULL) {
+		return NULL;
+	}
+
+	memcpy(new_ctx, ctx, sizeof(struct pair_parser_ctx));
+
+	if (ctx->content_buf != NULL && ctx->content_buf_size > 0) {
+		new_ctx->content_buf = malloc(ctx->content_buf_size);
+		if (new_ctx->content_buf == NULL) {
+			free(new_ctx);
+			return NULL;
+		}
+		memcpy(new_ctx->content_buf, ctx->content_buf, ctx->content_buf_used);
+	}
+
+	if (ctx->hdr_buf != NULL) {
+		new_ctx->hdr_buf = malloc(sizeof(struct offset_content_pair));
+		if (new_ctx->hdr_buf == NULL) {
+			free(new_ctx->content_buf);
+			free(new_ctx);
+			return NULL;
+		}
+		memcpy(new_ctx->hdr_buf, ctx->hdr_buf, sizeof(struct offset_content_pair));
+	}
+
+	if (ctx->data != NULL && ctx->data_size > 0) {
+		new_ctx->data = malloc(ctx->data_size);
+		if (new_ctx->data == NULL) {
+			free(new_ctx->content_buf);
+			free(new_ctx->hdr_buf);
+			free(new_ctx);
+			return NULL;
+		}
+		memcpy(new_ctx->data, ctx->data, ctx->data_size);
+		new_ctx->data_ptr = new_ctx->data + (ctx->data_ptr - ctx->data);
+	}
+
+	new_ctx->snapshots = NULL;
+	new_ctx->snapshots_buffer_size = 0;
+	new_ctx->snapshot_count = 0;
+
+	if (ctx->snapshots_buffer_size < ctx->snapshot_count + 1) {
+		ctx->snapshots_buffer_size = ctx->snapshot_count + 1;
+		ctx->snapshots = realloc(ctx->snapshots, ctx->snapshots_buffer_size * sizeof(struct pair_parser_ctx));
+		if (ctx->snapshots == NULL) {
+			fprintf(stderr, "realloc() snapshots failed!\n");
+			free(new_ctx->content_buf);
+			free(new_ctx->hdr_buf);
+			free(new_ctx->data);
+			free(new_ctx);
+			return NULL;
+		}
+	}
+
+	memcpy(&ctx->snapshots[ctx->snapshot_count], new_ctx, sizeof(struct pair_parser_ctx));
+	ctx->snapshot_count++;
+
+	return new_ctx;
+#else
+	return NULL;
+#endif
+}
+
+void *realloc_content_buf(struct pair_parser_ctx *ctx, size_t size) {
+	if ((ctx->content_buf_size - ctx->content_buf_used) < size) {
+		size_t new_size = max(ctx->content_buf_used + size, ctx->content_buf_size * 2);
+		ctx->content_buf = realloc(ctx->content_buf, new_size);
+		if (ctx->content_buf == NULL) {
+			fprintf(stderr, "realloc() content_buf failed!\n");
+			return NULL;
+		}
+		ctx->content_buf_size = new_size;
+	}
+	return (char *)ctx->content_buf + ctx->content_buf_used;
+}
+
+int copy_to_content_buf(struct pair_parser_ctx *ctx, char *data, size_t size) {
+	void *write_pos = realloc_content_buf(ctx, size);
+	if (write_pos == NULL) {
+		return -1;
+	}
+	memcpy(write_pos, data, size);
+	ctx->content_buf_used += size;
+	return 0;
+}
+
+struct offset_content_pair *
+get_next_content_pair(struct pair_parser_ctx *ctx) {
+	while (ctx->data_size > 0) {
+		if (ctx->prev_hdr_incomplete) {
+			pair_parser_debug(ctx, "ctx->prev_hdr_incomplete\n");
+
+			size_t copy_start_offset = sizeof(struct offset_content_pair) - ctx->prev_hdr_remaining;
+			if (ctx->data_size >= ctx->prev_hdr_remaining) {
+				pair_parser_debug(ctx, "ctx->data_size >= ctx->prev_hdr_remaining\n");
+
+				memcpy(ctx->hdr_buf + copy_start_offset, ctx->data_ptr, ctx->prev_hdr_remaining);
+				ctx->data_ptr += ctx->prev_hdr_remaining;
+				ctx->data_size -= ctx->prev_hdr_remaining;
+				ctx->prev_hdr_incomplete = false;
+
+				struct offset_content_pair *pair = (struct offset_content_pair *)ctx->hdr_buf;
+
+				if (pair->content_length > 1024 * 1024 * 1024) {  // 1GB limit
+					fprintf(stderr, "Content length too large: %zu\n", pair->content_length);
+					return NULL;
+				}
+
+				if (ctx->data_size <= pair->content_length) {
+					pair_parser_debug(ctx, "ctx->data_size <= pair->content_length\n");
+
+					if (copy_to_content_buf(ctx, ctx->data_ptr, ctx->data_size) != 0) {
+						return NULL;
+					}
+					ctx->data_ptr += ctx->data_size;
+					ctx->prev_content_read_remaining = pair->content_length - ctx->data_size;
+					ctx->data_size = 0;
+				} else {
+					pair_parser_debug(ctx, "ctx->data_size > pair->content_length\n");
+
+					if (copy_to_content_buf(ctx, ctx->data_ptr, pair->content_length) != 0) {
+						return NULL;
+					}
+					ctx->data_ptr += pair->content_length;
+					ctx->data_size -= pair->content_length;
+					snapshot_state(ctx);
+					// Full pair, no content. Content is read from ctx->content_buf
+					return pair;
+				}
+			} else {
+				pair_parser_debug(ctx, "ctx->data_size <= pair->content_length\n");
+
+				memcpy(ctx->hdr_buf + copy_start_offset, ctx->data_ptr, ctx->data_size);
+				ctx->prev_hdr_remaining -= ctx->data_size;
+				ctx->data_size = 0;
+				continue;
+			}
+		} else if (ctx->prev_content_read_remaining > 0) {
+			pair_parser_debug(ctx, "ctx->prev_content_read_remaining > 0\n");
+
+			if (ctx->prev_content_read_remaining <= ctx->data_size) {
+				pair_parser_debug(ctx, "ctx->prev_content_read_remaining <= ctx->data_size\n");
+
+				if (copy_to_content_buf(ctx, ctx->data_ptr, ctx->prev_content_read_remaining) != 0) {
+					return NULL;
+				}
+				ctx->data_ptr += ctx->prev_content_read_remaining;
+				ctx->data_size -= ctx->prev_content_read_remaining;
+				ctx->prev_content_read_remaining = 0;
+				snapshot_state(ctx);
+				return (struct offset_content_pair *)ctx->data_ptr;
+			} else {
+				pair_parser_debug(ctx, "ctx->prev_content_read_remaining > ctx->data_size\n");
+
+				if (copy_to_content_buf(ctx, ctx->data_ptr, ctx->data_size) != 0) {
+					return NULL;
+				}
+				ctx->prev_content_read_remaining -= ctx->data_size;
+				ctx->data_size = 0;
+				snapshot_state(ctx);
+				continue;
+			}
+		}
+
+		// Search magic number
+		bool found_magic = false;
+		while (ctx->data_size > 0) {
+			if (ctx->partial_magic_bytes > 0) {
+				pair_parser_debug(ctx, "ctx->partial_magic_bytes > 0\n");
+
+				int bytes_needed = sizeof(u32) - ctx->partial_magic_bytes;
+				int bytes_available = ctx->data_size < bytes_needed ? ctx->data_size : bytes_needed;
+
+				for (int i = 0; i < bytes_available; i++) {
+					ctx->partial_magic = (ctx->partial_magic << 8) | ctx->data_ptr[i];
+				}
+				ctx->partial_magic_bytes += bytes_available;
+
+				if (ctx->partial_magic_bytes == sizeof(u32)) {
+					pair_parser_debug(ctx, "ctx->partial_magic_bytes == sizeof(u32)\n");
+
+					if (ctx->partial_magic == OFFSET_CONTENT_PAIR_MAGIC) {
+						found_magic = true;
+						ctx->frame_count++;
+						ctx->data_ptr += bytes_available;
+						ctx->data_size -= bytes_available;
+						ctx->partial_magic_bytes = 0;
+						break;
+					} else {
+						ctx->partial_magic_bytes = 0;
+					}
+				} else {
+					pair_parser_debug(ctx, "ctx->partial_magic_bytes != sizeof(u32)\n");
+
+					ctx->data_ptr += bytes_available;
+					ctx->data_size -= bytes_available;
+					continue;
+				}
+			}
+
+			if (ctx->data_size >= sizeof(u32)) {
+				pair_parser_debug(ctx, "ctx->data_size >= sizeof(u32)\n");
+
+				u32 magic;
+				memcpy(&magic, ctx->data_ptr, sizeof(u32));
+				if (magic == OFFSET_CONTENT_PAIR_MAGIC) {
+					found_magic = true;
+					ctx->frame_count++;
+					ctx->data_ptr += sizeof(u32);
+					ctx->data_size -= sizeof(u32);
+					break;
+				}
+				ctx->data_ptr++;
+				ctx->data_size--;
+			} else {
+				pair_parser_debug(ctx, "ctx->data_size < sizeof(u32)\n");
+				ctx->partial_magic = 0;
+				for (int i = 0; i < ctx->data_size; i++) {
+					ctx->partial_magic = (ctx->partial_magic << 8) | ctx->data_ptr[i];
+				}
+				ctx->partial_magic_bytes = ctx->data_size;
+				ctx->data_size = 0;
+				break;
+			}
+		}
+
+		if (!found_magic) {
+			pair_parser_debug(ctx, "has not found magic after allat\n");
+			continue;
+		}
+
+		// Check if we read more than the header length
+		if (ctx->data_size >= sizeof(struct offset_content_pair) - sizeof(u32)) {
+			pair_parser_debug(ctx, "ctx->data_size >= sizeof(struct offset_content_pair) - sizeof(u32)\n");
+
+			memcpy(ctx->hdr_buf, ctx->data_ptr, sizeof(u32));
+			struct offset_content_pair *pair = (struct offset_content_pair *)(ctx->data_ptr - sizeof(u32));
+			ctx->data_ptr += (sizeof(struct offset_content_pair) - sizeof(u32));
+			ctx->data_size -= (sizeof(struct offset_content_pair) - sizeof(u32));
+
+			if (pair->content_length > 1024 * 1024 * 1024) {  // 1GB limit
+				fprintf(stderr, "Content length too large: %zu\n", pair->content_length);
+				snapshot_state(ctx);
+				return NULL;
+			}
+
+			if (ctx->data_size < pair->content_length) {
+				pair_parser_debug(ctx, "ctx->data_size < pair->content_length\n");
+
+				if (copy_to_content_buf(ctx, ctx->data_ptr, ctx->data_size) != 0) {
+					return NULL;
+				}
+				ctx->prev_content_read_remaining = pair->content_length - ctx->data_size;
+				ctx->data_size = 0;
+				snapshot_state(ctx);
+				continue;
+			} else {
+				pair_parser_debug(ctx, "ctx->data_size >= pair->content_length\n");
+
+				if (copy_to_content_buf(ctx, ctx->data_ptr, pair->content_length) != 0) {
+					return NULL;
+				}
+				ctx->data_ptr += pair->content_length;
+				ctx->data_size -= pair->content_length;
+				snapshot_state(ctx);
+				return pair;
+			}
+		} else {
+			pair_parser_debug(ctx, "ctx->data_size < sizeof(struct offset_content_pair) - sizeof(u32)\n");
+
+			ctx->prev_hdr_incomplete = true;
+			ctx->prev_hdr_remaining = sizeof(struct offset_content_pair) - sizeof(u32) - ctx->data_size;
+
+			memcpy(ctx->hdr_buf, ctx->data_ptr - sizeof(u32), sizeof(u32));
+			memcpy(ctx->hdr_buf + sizeof(u32), ctx->data_ptr, ctx->data_size);
+			ctx->data_size = 0;
+		}
+	}
+
+	return NULL;
+}
+
+int build_index_main(int argc, char **argv) {
 	char *infile = NULL;
 	char *outfile = NULL;
 
@@ -840,171 +1401,107 @@ int print_offset_content_pair(int argc, char **argv) {
 	}
 
 	FILE *fin = infile ? fopen_orDie(infile, "rb") : stdin;
+	struct stat st;
+	if (fstat(fileno(fin), &st) != 0) {
+		printf("Failed to stat file: %s\n", strerror(errno));
+		return 1;
+	}
+
+	struct index_entry *index = malloc(1024);
+	size_t prev_newline_offset = 0;
+	size_t prev_newline_frame = 0;
+	free(index);
+
+	struct pair_parser_ctx ctx;
+	memset(&ctx, 0, sizeof(ctx));
+
+	struct pair_parser_ctx *snapshots = malloc(sizeof(struct pair_parser_ctx));
+	if (snapshots == NULL) {
+		fprintf(stderr, "malloc() snapshots failed!\n");
+		return 1;
+	}
+	memset(snapshots, 0, sizeof(struct pair_parser_ctx));
+	ctx.snapshots = snapshots;
+
 	size_t buf_size = 10 * 1024 * 1024;
-	char *buf = malloc(buf_size);
-	if (buf == NULL) {
-		fprintf(stderr, "malloc() buf failed!\n");
-		if (fin != stdin) fclose(fin);
+	// size_t buf_size = st.st_size;
+	ctx.data = malloc_orDie(buf_size);
+
+	ctx.hdr_buf = malloc_orDie(sizeof(struct offset_content_pair));
+
+	size_t content_buf_size = buf_size;
+	ctx.content_buf = malloc_orDie(content_buf_size);
+	ctx.content_buf_size = content_buf_size;
+
+	char *orig_file = "humongous_file.txt";
+	FILE *orig_file_fin = fopen(orig_file, "r");
+	if (orig_file_fin == NULL) {
+		fprintf(stderr, "Failed to open file: %s\n", orig_file);
 		return 1;
 	}
+	char *orig_file_data = malloc(4096);
 
-	char *bufptr = buf;
-	ssize_t read = 0;
-	size_t prev_content_read_remaining = 0;
-	bool prev_hdr_incomplete = false;
-	size_t prev_hdr_remaining = 0;
-	void *hdr_buf = malloc(sizeof(struct offset_content_pair));
-	if (hdr_buf == NULL) {
-		fprintf(stderr, "malloc() hdr_buf failed!\n");
-		free(buf);
-		if (fin != stdin) fclose(fin);
-		return 1;
-	}
+	// char *content_str = malloc(4096);
+	// size_t content_str_size = 4096;
+	while ((ctx.data_size = fread_orDie(ctx.data, buf_size, fin))) {
+		ctx.data_ptr = ctx.data;
 
-	u32 partial_magic = 0;
-	int partial_magic_bytes = 0;
-
-	u64 frame_count = 0;
-
-	while ((read = fread_orDie(buf, buf_size, fin))) {
-		bufptr = buf;
-
-		while (read > 0) {
-			if (prev_hdr_incomplete) {
-				size_t copy_start_offset = sizeof(struct offset_content_pair) - prev_hdr_remaining;
-				if (read >= prev_hdr_remaining) {
-					memcpy(hdr_buf + copy_start_offset, bufptr, prev_hdr_remaining);
-					bufptr += prev_hdr_remaining;
-					read -= prev_hdr_remaining;
-					prev_hdr_incomplete = false;
-
-					struct offset_content_pair *pair = (struct offset_content_pair *)hdr_buf;
-
-					if (pair->content_length > 1024 * 1024 * 1024) {  // 1GB limit
-						fprintf(stderr, "Content length too large: %zu\n", pair->content_length);
-						goto cleanup;
-					}
-
-					if (read < pair->content_length) {
-						fwrite(bufptr, 1, read, stdout);
-						prev_content_read_remaining = pair->content_length - read;
-						read = 0;
-						continue;
-					} else {
-						fwrite(bufptr, 1, pair->content_length, stdout);
-						bufptr += pair->content_length;
-						read -= pair->content_length;
-					}
-				} else {
-					memcpy(hdr_buf + copy_start_offset, bufptr, read);
-					prev_hdr_remaining -= read;
-					read = 0;
-					continue;
-				}
-			} else if (prev_content_read_remaining > 0) {
-				if (prev_content_read_remaining <= read) {
-					fwrite(bufptr, 1, prev_content_read_remaining, stdout);
-					bufptr += prev_content_read_remaining;
-					read -= prev_content_read_remaining;
-					prev_content_read_remaining = 0;
-				} else {
-					fwrite(bufptr, 1, read, stdout);
-					prev_content_read_remaining -= read;
-					read = 0;
-					continue;
-				}
+		while (ctx.data_size > 0) {
+			struct offset_content_pair *pair = get_next_content_pair(&ctx);
+			if (pair == NULL) {
+				break;
+			}
+			int n = fread(orig_file_data, pair->content_length, 1, orig_file_fin);
+			if (memcmp(ctx.content_buf, orig_file_data, pair->content_length) != 0) {
+				pair_parser_debug(&ctx, "Content mismatch on frame %ld, content length: %ld\n", pair->frame_index, pair->content_length);
+				fprintf(stdout, "\n----- Original file content -----\n");
+				fwrite(orig_file_data, pair->content_length, 1, stdout);
+				fprintf(stdout, "\n\n----- Current file content -----\n\n");
+				fwrite(ctx.content_buf, pair->content_length, 1, stdout);
+				fprintf(stdout, "FIN\n");
+				return 1;
 			}
 
-			bool found_magic = false;
-			while (read > 0) {
-				if (partial_magic_bytes > 0) {
-					int bytes_needed = sizeof(u32) - partial_magic_bytes;
-					int bytes_available = read < bytes_needed ? read : bytes_needed;
+			// dump parser state
+			// fprintf(stdout, "----- Parser states leading up to this mismatch -----\n");
+			// for (int i = 0; i < ctx.snapshot_count; i++) {
+			// struct pair_parser_ctx snapshot = ctx.snapshots[i];
+			// fprintf(stdout, "Snapshot %d:\n", i);
+			// fprintf(stdout, "data_size: %zu\n", snapshot.data_size);
+			// fprintf(stdout, "data_ptr: %p\n", snapshot.data_ptr);
+			// fprintf(stdout, "prev_hdr_incomplete: %d\n", snapshot.prev_hdr_incomplete);
+			// fprintf(stdout, "prev_hdr_remaining: %zu\n", snapshot.prev_hdr_remaining);
+			// fprintf(stdout, "partial_magic: %x\n", snapshot.partial_magic);
+			// fprintf(stdout, "partial_magic_bytes: %d\n", snapshot.partial_magic_bytes);
+			// fprintf(stdout, "frame_count: %ld\n", snapshot.frame_count);
+			// fprintf(stdout, "content_buf_used: %zu\n", snapshot.content_buf_used);
+			// fprintf(stdout, "content_buf_size: %zu\n", snapshot.content_buf_size);
+			// fprintf(stdout, "\n");
+			// }
 
-					for (int i = 0; i < bytes_available; i++) {
-						partial_magic = (partial_magic << 8) | bufptr[i];
-					}
-					partial_magic_bytes += bytes_available;
+			// fprintf(stderr, "Content mismatch\n");
 
-					if (partial_magic_bytes == sizeof(u32)) {
-						if (partial_magic == OFFSET_CONTENT_PAIR_MAGIC) {
-							found_magic = true;
-							frame_count++;
-							bufptr += bytes_available;
-							read -= bytes_available;
-							partial_magic_bytes = 0;
-							break;
-						} else {
-							partial_magic_bytes = 0;
-						}
-					} else {
-						bufptr += bytes_available;
-						read -= bytes_available;
-						continue;
-					}
-				}
-
-				if (read >= sizeof(u32)) {
-					u32 magic;
-					memcpy(&magic, bufptr, sizeof(u32));
-					if (magic == OFFSET_CONTENT_PAIR_MAGIC) {
-						found_magic = true;
-						frame_count++;
-						bufptr += sizeof(u32);
-						read -= sizeof(u32);
-						break;
-					}
-					bufptr++;
-					read--;
-				} else {
-					partial_magic = 0;
-					for (int i = 0; i < read; i++) {
-						partial_magic = (partial_magic << 8) | bufptr[i];
-					}
-					partial_magic_bytes = read;
-					read = 0;
-					break;
-				}
-			}
-
-			if (!found_magic) {
-				continue;
-			}
-
-			if (read >= sizeof(struct offset_content_pair) - sizeof(u32)) {
-				struct offset_content_pair *pair = (struct offset_content_pair *)(bufptr - sizeof(u32));
-				bufptr += (sizeof(struct offset_content_pair) - sizeof(u32));
-				read -= (sizeof(struct offset_content_pair) - sizeof(u32));
-
-				if (pair->content_length > 1024 * 1024 * 1024) {  // 1GB limit
-					fprintf(stderr, "Content length too large: %zu\n", pair->content_length);
-					goto cleanup;
-				}
-
-				if (read < pair->content_length) {
-					fwrite(bufptr, 1, read, stdout);
-					prev_content_read_remaining = pair->content_length - read;
-					read = 0;
-					continue;
-				} else {
-					fwrite(bufptr, 1, pair->content_length, stdout);
-					bufptr += pair->content_length;
-					read -= pair->content_length;
-				}
-			} else {
-				prev_hdr_incomplete = true;
-				prev_hdr_remaining = sizeof(struct offset_content_pair) - sizeof(u32) - read;
-
-				memcpy(hdr_buf, bufptr - sizeof(u32), sizeof(u32));
-				memcpy(hdr_buf + sizeof(u32), bufptr, read);
-				read = 0;
-			}
+			// return 1;
+			// }
+			// fwrite(ctx.content_buf, pair->content_length, 1, stdout);
+			// fwrite(ctx.content_buf, pair->content_length, 1, stdout);
+			// // if (pair->content_length > content_str_size + 1) {
+			// // 	content_str_size = pair->content_length + 1;
+			// // 	content_str = realloc(content_str, content_str_size);
+			// // }
+			// // memcpy(content_str, pair->content, pair->content_length);
+			// // content_str[pair->content_length] = '\0';
+			// // printf("%s\n", content_str);
+			// return 0;
+			ctx.content_buf_used = 0;
+			fwrite(ctx.content_buf, pair->content_length, 1, stdout);
 		}
 	}
 
 cleanup:
-	free(buf);
-	free(hdr_buf);
+	free(ctx.data);
+	free(ctx.hdr_buf);
+	free(ctx.content_buf);
 	if (fin != stdin) fclose(fin);
 	return 0;
 }

@@ -1,6 +1,6 @@
 CC = clang
-COMMON_CFLAGS = -std=c17 -march=native
-DEBUG_CFLAGS = $(COMMON_CFLAGS) -O0 -g3 -gdwarf-4 -DDEBUG
+COMMON_CFLAGS = -std=c17 -march=native -mavx -msse
+DEBUG_CFLAGS = $(COMMON_CFLAGS) -pg -O0 -ggdb3 -DDEBUG
 ASAN_CFLAGS = $(DEBUG_CFLAGS) -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls -fno-common
 ASAN_LDFLAGS = -fsanitize=address -fsanitize=undefined
 

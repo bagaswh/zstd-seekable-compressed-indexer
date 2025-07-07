@@ -59,12 +59,12 @@
             }
         },
         {
-            "name": "Debug print-offset-content-pair",
+            "name": "Debug build-index",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/program",
             "args": [
-                "print-offset-content-pair",
+                "build-index",
                 "-i",
                 "pairs.bin"
             ],
@@ -89,12 +89,12 @@
             }
         },
         {
-            "name": "Debug print-offset-content-pair (AddressSanitizer)",
+            "name": "Debug build-index (AddressSanitizer)",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/program-asan",
             "args": [
-                "print-offset-content-pair",
+                "build-index",
                 "-i",
                 "pairs.bin"
             ],
