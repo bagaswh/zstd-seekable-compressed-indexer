@@ -5,7 +5,7 @@
             "name": "Debug Program",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/program",
+            "program": "${workspaceFolder}/build/program-debug",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
@@ -38,7 +38,11 @@
             "environment": [
                 {
                     "name": "ASAN_OPTIONS",
-                    "value": "abort_on_error=1:fast_unwind_on_malloc=0"
+                    "value": "symbolize=1:abort_on_error=1:halt_on_error=1:print_stacktrace=1"
+                },
+                {
+                    "name": "ASAN_SYMBOLIZER_PATH",
+                    "value": "/usr/bin/llvm-symbolizer"
                 }
             ],
             "externalConsole": false,
@@ -62,11 +66,11 @@
             "name": "Debug build-index",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/program",
+            "program": "${workspaceFolder}/build/program-debug",
             "args": [
                 "build-index",
                 "-i",
-                "pairs.bin"
+                "humongous_file.txt.seekable.zst"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
@@ -103,7 +107,11 @@
             "environment": [
                 {
                     "name": "ASAN_OPTIONS",
-                    "value": "abort_on_error=1:fast_unwind_on_malloc=0"
+                    "value": "symbolize=1:abort_on_error=1:halt_on_error=1:print_stacktrace=1"
+                },
+                {
+                    "name": "ASAN_SYMBOLIZER_PATH",
+                    "value": "/usr/bin/llvm-symbolizer"
                 }
             ],
             "externalConsole": false,
@@ -127,9 +135,10 @@
             "name": "Attach to Process",
             "type": "cppdbg",
             "request": "attach",
-            "program": "${workspaceFolder}/build/program",
+            "program": "${workspaceFolder}/build/program-debug",
             "processId": "${command:pickProcess}",
-            "MIMode": "lldb"
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb"
         }
     ]
 }

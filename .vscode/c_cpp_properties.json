@@ -6,6 +6,8 @@
                 "${workspaceFolder}/**",
                 "${workspaceFolder}/external/zstd/lib/**",
                 "${workspaceFolder}/external/zstd/contrib/seekable_format/**",
+                "${workspaceFolder}/external/xxHash/",
+                "${workspaceFolder}/external/cutils/",
                 "/usr/local/include",
                 "/usr/include/x86_64-linux-gnu",
                 "/usr/include",

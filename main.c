@@ -14,6 +14,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#include "slice.h"
+#include "xxhash.h"
 #include "zstd.h"
 #include "zstd_seekable.h"
 
@@ -37,10 +39,7 @@ struct subcommand {
 
 static struct subcommand subcommands[] = {
     {"compress", compress_main, "Compress files"},
-    {"write-pairs", write_pairs_main, "Write pairs"},
     {"build-index", build_index_main, "Build index from streaming pairs"},
-    // {"decompress", decompress_main, "Decompress files"},
-    {"decompress-frame", decompress_frame_main, "Decompress frame"},
     {"info", info_main, "Show file information"},
     {NULL, NULL, NULL}};
 
@@ -298,105 +297,10 @@ int compress_main(int argc, char **argv) {
 	return ret;
 }
 
-struct seek_table_entry {
-	u32 compressed_size;
-	u32 decompressed_size;
-	u32 checksum;
-
-	u64 compressed_end_offset;
-	u64 decompressed_end_offset;
-};
-
-struct seek_table {
-	u32 footer_magic;
-	u32 num_of_frames;
-	u8 seek_table_descriptor;
-	u32 entry_size;
-	u8 checksum_flag;
-	struct seek_table_entry *entries;
-};
-
-#define ZSTD_MAGICNUMBER 0xFD2FB528
-#define ZSTD_SEEKABLE_MAGICNUMBER 0x8F92EAB1
-#define ZSTD_SEEKTABLE_FOOTER_SIZE 9
-
-struct seek_table *load_seek_table(u8 *data, size_t file_size, struct seek_table *table) {
-	u8 *footer_ptr = data + file_size - ZSTD_SEEKTABLE_FOOTER_SIZE;
-
-	u32 footer_magic;
-	memcpy(&footer_magic, footer_ptr + 5, sizeof(u32));
-	if (footer_magic != ZSTD_SEEKABLE_MAGICNUMBER) {
-		fprintf(stderr, "Invalid footer magic number, got: %x\n", footer_magic);
-		return NULL;
-	}
-	table->footer_magic = footer_magic;
-
-	u32 num_of_frames;
-	memcpy(&num_of_frames, footer_ptr, sizeof(u32));
-	table->num_of_frames = num_of_frames;
-	table->entries = malloc(sizeof(struct seek_table_entry) * num_of_frames);
-	if (table->entries == NULL) {
-		fprintf(stderr, "malloc() table->entries failed!\n");
-		return NULL;
-	}
-
-	u8 seek_table_descriptor;
-	memcpy(&seek_table_descriptor, footer_ptr + 4, sizeof(u8));
-	table->seek_table_descriptor = seek_table_descriptor;
-
-	u32 entry_size = 8;
-
-	u8 checksum_flag = (seek_table_descriptor >> 7) & 0x1;
-	if (checksum_flag) {
-		entry_size += 4;
-	}
-	table->entry_size = entry_size;
-	table->checksum_flag = checksum_flag;
-
-	u8 *seek_table_ptr = footer_ptr - (entry_size * num_of_frames);
-	u64 last_compressed_offset = 0;
-	u64 last_decompressed_offset = 0;
-	for (int i = 0; i < num_of_frames; i++) {
-		memcpy(&(table->entries[i]), seek_table_ptr + i * entry_size, entry_size);
-		last_compressed_offset += table->entries[i].compressed_size;
-		last_decompressed_offset += table->entries[i].decompressed_size;
-		(&(table->entries[i]))->compressed_end_offset = last_compressed_offset;
-		(&(table->entries[i]))->decompressed_end_offset = last_decompressed_offset;
-	}
-
-	return table;
-}
-
 struct print_info_args {
 	bool print_seek_table;
 	bool print_frames_list;
 };
-
-void zstd_seekable_print_info(u8 *data, size_t file_size, struct print_info_args args) {
-	struct seek_table table;
-	if (!load_seek_table(data, file_size, &table)) {
-		fprintf(stderr, "load_seek_table() failed!\n");
-		return;
-	}
-
-	printf("Number of frames: %d\n", table.num_of_frames);
-
-	if (table.checksum_flag) {
-		printf("Checksum: enabled\n");
-	}
-
-	if (args.print_seek_table) {
-		for (int i = 0; i < table.num_of_frames; i++) {
-			struct seek_table_entry entry = table.entries[i];
-			size_t c_start_off = entry.compressed_end_offset - entry.compressed_size;
-			size_t c_end_off = entry.compressed_end_offset;
-			size_t d_start_off = entry.decompressed_end_offset - entry.decompressed_size;
-			size_t d_end_off = entry.decompressed_end_offset;
-			printf("Frame %d: (coffset: %ld - %ld, %ld bytes); (doffset: %ld - %ld, %ld bytes), checksum: %x\n",
-			       i, c_start_off, c_end_off, c_end_off - c_start_off, d_start_off, d_end_off, d_end_off - d_start_off, entry.checksum);
-		}
-	}
-}
 
 void stringify_bits(u8 byte, char *result) {
 	for (int bit = 0; bit < (sizeof(u8) * 8); bit++) {
@@ -493,6 +397,8 @@ void print_frame(u8 *ptr) {
 	free(fhd_bits);
 }
 
+void zstd_seekable_print_info(void *ptr, size_t size, struct print_info_args args) {}
+
 int info_main(int argc, char **argv) {
 	char *infile = NULL;
 	char *outfile = NULL;
@@ -566,255 +472,6 @@ int info_main(int argc, char **argv) {
 }
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
-
-int decompress_frame(ZSTD_seekable *seekable, void *buf_out, size_t buf_out_size, size_t start_offset, size_t end_offset) {
-	size_t const result = ZSTD_seekable_decompress(seekable, buf_out, MIN(end_offset - start_offset, buf_out_size), end_offset);
-	if (ZSTD_isError(result)) {
-		fprintf(stderr, "ZSTD_seekable_decompress() error : %s \n",
-		        ZSTD_getErrorName(result));
-		exit(12);
-	}
-	return result;
-}
-
-int decompress_frame_main(int argc, char **argv) {
-	char *infile = NULL;
-	char *outfile = NULL;
-	size_t frame_index = 0;
-	size_t start_offset = 0;
-	size_t end_offset = 0;
-
-	static struct option long_options[] = {
-	    {"infile", required_argument, 0, 'i'},
-	    {"outfile", required_argument, 0, 'o'},
-	    {"frame-index", required_argument, 0, 'f'},
-	    {"start-offset", required_argument, 0, 's'},
-	    {"end-offset", required_argument, 0, 'e'},
-	    {"help", no_argument, 0, 'h'},
-	    {0, 0, 0, 0}};
-
-	while (1) {
-		int c = getopt_long(argc, argv, "i:o:f:s:e:vh", long_options, NULL);
-		if (c == -1) break;
-
-		switch (c) {
-		case 'i':
-			infile = optarg;
-			break;
-		case 'o':
-			outfile = optarg;
-			break;
-		case 'f':
-			frame_index = atoi(optarg);
-			break;
-		case 's':
-			start_offset = atoi(optarg);
-			break;
-		case 'e':
-			end_offset = atoi(optarg);
-			break;
-		case 'h':
-			printf("Usage: %s [options]\n", argv[0]);
-			printf("Options:\n");
-			printf("  -i, --infile FILE     Input file (default: stdin)\n");
-			printf("  -o, --outfile FILE    Output file (default: stdout)\n");
-			printf("  -f, --frame-index INT Frame index\n");
-			printf("  -s, --start-offset INT Start offset\n");
-			printf("  -e, --end-offset INT End offset\n");
-			printf("  -h, --help            Show this help\n");
-			return 0;
-		case '?':
-			return 1;
-		}
-	}
-
-	if (frame_index == 0 && start_offset == 0 && end_offset == 0) {
-		printf("Please specify at least one of the following options: --frame-index, --start-offset, --end-offset\n");
-		return 1;
-	}
-
-	FILE *in = infile ? fopen_orDie(infile, "rb") : stdin;
-	struct stat st;
-	if (fstat(fileno(in), &st) != 0) {
-		printf("Failed to stat file: %s\n", strerror(errno));
-		return 1;
-	}
-
-	ZSTD_seekable *const seekable = ZSTD_seekable_create();
-	if (seekable == NULL) {
-		fprintf(stderr, "ZSTD_seekable_create() error \n");
-		exit(10);
-	}
-
-	u8 *data = infile ? mmap_or_die(in, st.st_size) : NULL;
-	size_t const zstd_init_buf_ret = ZSTD_seekable_initBuff(seekable, data, st.st_size);
-	if (ZSTD_isError(zstd_init_buf_ret)) {
-		fprintf(stderr, "ZSTD_seekable_init() error : %s \n", ZSTD_getErrorName(zstd_init_buf_ret));
-		exit(11);
-	}
-
-	FILE *out = outfile ? fopen_orDie(outfile, "wb") : stdout;
-
-	size_t const buff_in_size = ZSTD_DStreamInSize();
-	void *buf_in = malloc_orDie(buff_in_size);
-	struct seek_table table;
-	if (!load_seek_table(data, st.st_size, &table)) {
-		fprintf(stderr, "load_seek_table() failed!\n");
-		return 1;
-	}
-
-	if (frame_index != 0 && frame_index < table.num_of_frames) {
-		struct seek_table_entry entry = table.entries[frame_index];
-		size_t start_off = entry.decompressed_end_offset - entry.decompressed_size;
-		size_t end_off = entry.decompressed_end_offset;
-		char *buf_out = malloc(end_off - start_off);
-		if (buf_out == NULL) {
-			fprintf(stderr, "malloc() buf_out failed!\n");
-			return 1;
-		}
-		while (start_off < end_off) {
-			size_t const result = ZSTD_seekable_decompress(seekable, buf_out, end_off - start_off, start_off);
-			if (!result) {
-				break;
-			}
-			if (ZSTD_isError(result)) {
-				fprintf(stderr, "ZSTD_seekable_decompress() error : %s \n",
-				        ZSTD_getErrorName(result));
-				exit(12);
-			}
-			fwrite_orDie(buf_out, result, stdout);
-			start_off += result;
-		}
-	} else if (frame_index != 0) {
-		fprintf(stderr, "Invalid frame index: %ld\n", frame_index);
-		return 1;
-	}
-
-	return 0;
-}
-
-#define OFFSET_CONTENT_PAIR_MAGIC 0x9143DCA8
-
-struct __attribute__((packed)) offset_content_pair {
-	u32 magic;
-	u64 content_length;
-
-	u64 frame_index;
-
-	u64 compressed_start_offset;
-	u64 decompressed_start_offset;
-	u64 compressed_end_offset;
-	u64 decompressed_end_offset;
-
-	char content[];
-};
-
-int write_pairs_main(int argc, char **argv) {
-	char *infile = NULL;
-	char *outfile = NULL;
-
-	static struct option long_options[] = {
-	    {"infile", required_argument, 0, 'i'},
-	    {"outfile", required_argument, 0, 'o'},
-	    {"help", no_argument, 0, 'h'},
-	    {0, 0, 0, 0}};
-
-	while (1) {
-		int c = getopt_long(argc, argv, "i:o:l:s:vh", long_options, NULL);
-		if (c == -1) break;
-
-		switch (c) {
-		case 'i':
-			infile = optarg;
-			break;
-		case 'o':
-			outfile = optarg;
-			break;
-		case 'h':
-			printf("Usage: %s [options]\n", argv[0]);
-			printf("Options:\n");
-			printf("  -i, --infile FILE     Compressed file to build the index from\n");
-			printf("  -o, --outfile FILE    Index file output\n");
-			printf("  -h, --help            Show this help\n");
-			return 0;
-		case '?':
-			return 1;
-		}
-	}
-
-	FILE *in = infile ? fopen_orDie(infile, "rb") : stdin;
-	struct stat st;
-	if (fstat(fileno(in), &st) != 0) {
-		printf("Failed to stat file: %s\n", strerror(errno));
-		return 1;
-	}
-
-	ZSTD_seekable *const seekable = ZSTD_seekable_create();
-	if (seekable == NULL) {
-		fprintf(stderr, "ZSTD_seekable_create() error \n");
-		exit(10);
-	}
-
-	u8 *data = infile ? mmap_or_die(in, st.st_size) : NULL;
-	size_t const zstd_init_buf_ret = ZSTD_seekable_initBuff(seekable, data, st.st_size);
-	if (ZSTD_isError(zstd_init_buf_ret)) {
-		fprintf(stderr, "ZSTD_seekable_init() error : %s \n", ZSTD_getErrorName(zstd_init_buf_ret));
-		exit(11);
-	}
-
-	FILE *out = outfile ? fopen_orDie(outfile, "wb") : stdout;
-
-	size_t const buff_in_size = ZSTD_DStreamInSize();
-	void *buf_in = malloc_orDie(buff_in_size);
-	struct seek_table table;
-	if (!load_seek_table(data, st.st_size, &table)) {
-		fprintf(stderr, "load_seek_table() failed!\n");
-		return 1;
-	}
-
-	size_t const buf_out_size = ZSTD_DStreamOutSize();
-	struct offset_content_pair *pair = malloc(sizeof(struct offset_content_pair) + buf_out_size);
-	if (pair == NULL) {
-		fprintf(stderr, "malloc() pair failed!\n");
-		return 1;
-	}
-
-	pair->magic = OFFSET_CONTENT_PAIR_MAGIC;
-	for (int i = 0; i < table.num_of_frames; i++) {
-		pair->frame_index = i;
-		pair->compressed_start_offset = table.entries[i].compressed_end_offset - table.entries[i].compressed_size;
-		pair->compressed_end_offset = table.entries[i].compressed_end_offset;
-
-		pair->decompressed_start_offset = table.entries[i].decompressed_end_offset - table.entries[i].decompressed_size;
-		pair->decompressed_end_offset = table.entries[i].decompressed_end_offset;
-
-		struct seek_table_entry entry = table.entries[i];
-		size_t start_off = entry.decompressed_end_offset - entry.decompressed_size;
-		size_t end_off = entry.decompressed_end_offset;
-		while (start_off < end_off) {
-			size_t const result = ZSTD_seekable_decompress(seekable, &(pair->content), MIN(end_off - start_off, buf_out_size), start_off);
-			if (!result) {
-				break;
-			}
-			if (ZSTD_isError(result)) {
-				fprintf(stderr, "ZSTD_seekable_decompress() error : %s \n",
-				        ZSTD_getErrorName(result));
-				exit(12);
-			}
-			pair->content_length = result;
-			fwrite_orDie(pair, sizeof(struct offset_content_pair) + pair->content_length, stdout);
-			start_off += result;
-		}
-	}
-
-	ZSTD_seekable_free(seekable);
-	fclose_orDie(in);
-	fclose_orDie(out);
-	free(buf_in);
-	free(pair);
-
-	return 0;
-}
 
 /* ---- begin CPUID ---- */
 
@@ -899,9 +556,10 @@ int check_avx2_support() {
 
 #define INDEX_MAGIC 0x7EFB8DC1
 
-int index_of_newline_scalar(char *data, size_t size) {
-	if (size == 0) return -1;
-	for (size_t i = 0; i < size; i++) {
+int index_of_newline_scalar(char *data, ssize_t start, ssize_t size) {
+	if (start < 0 || start >= size) return -1;
+	if ((size - start) == 0) return -1;
+	for (ssize_t i = start; i < size; i++) {
 		if (data[i] == '\n') {
 			return i;
 		}
@@ -909,14 +567,15 @@ int index_of_newline_scalar(char *data, size_t size) {
 	return -1;
 }
 
-int index_of_newline_sse(char *data, size_t size) {
-	if (size == 0) return -1;
+int index_of_newline_sse(char *data, ssize_t start, ssize_t size) {
+	if (start < 0 || start >= size) return -1;
+	if ((size - start) == 0) return -1;
 
 	const __m128i newline_vec = _mm_set1_epi8('\n');
-	size_t i = 0;
+	ssize_t i = 0;
 
 	// Process 16 bytes at a time
-	for (i = 0; i <= size - 16; i += 16) {
+	for (i = start; i <= size - 16; i += 16) {
 		__m128i chunk = _mm_loadu_si128((__m128i *)(data + i));
 		__m128i cmp = _mm_cmpeq_epi8(chunk, newline_vec);
 
@@ -938,14 +597,15 @@ int index_of_newline_sse(char *data, size_t size) {
 	return -1;
 }
 
-int index_of_newline_avx2(char *data, size_t size) {
-	if (size == 0) return -1;
+int index_of_newline_avx2(char *data, ssize_t start, ssize_t size) {
+	if (start < 0 || start >= size) return -1;
+	if ((size - start) == 0) return -1;
 
 	const __m256i newline_vec = _mm256_set1_epi8('\n');
-	size_t i = 0;
+	ssize_t i = 0;
 
 	// Process 32 bytes at a time
-	for (i = 0; i <= size - 32; i += 32) {
+	for (i = start; i <= size - 32; i += 32) {
 		__m256i chunk = _mm256_loadu_si256((__m256i *)(data + i));
 		__m256i cmp = _mm256_cmpeq_epi8(chunk, newline_vec);
 
@@ -967,7 +627,7 @@ int index_of_newline_avx2(char *data, size_t size) {
 	return -1;
 }
 
-int index_of_newline_avx2_aligned(char *data, size_t size) {
+int index_of_newline_avx2_aligned(char *data, ssize_t start, ssize_t size) {
 	if (size == 0) return -1;
 
 	const __m256i newline_vec = _mm256_set1_epi8('\n');
@@ -1013,363 +673,216 @@ int index_of_newline_avx2_aligned(char *data, size_t size) {
 	return -1;
 }
 
-int index_of_newline_auto(char *data, size_t size) {
-	if (size < 32) {
-		return index_of_newline_scalar(data, size);
-	}
-	if (size < 128 && check_sse4_support()) {
-		return index_of_newline_sse(data, size);
-	}
-	if (size < 256 && check_avx2_support()) {
-		return index_of_newline_avx2(data, size);
-	}
-	return index_of_newline_scalar(data, size);
+int index_of_newline_auto(char *data, ssize_t start, ssize_t size) {
+	if (start < 0 || start >= size) return -1;
+	return index_of_newline_scalar(data, start, size);
+	// if ((size - start) < 32) {
+	// }
+	// if ((size - start) < 128 && check_sse4_support()) {
+	// 	return index_of_newline_sse(data, start, size);
+	// }
+	// if ((size - start) < 256 && check_avx2_support()) {
+	// 	return index_of_newline_avx2(data, start, size);
+	// }
+	// return index_of_newline_scalar(data, start, size);
 }
 
-struct pair_parser_ctx {
-	char *data;
-	char *data_ptr;
-	size_t data_size;
+u64 __attribute__((always_inline)) xxhash64(void *data, size_t len) {
+	return XXH3_64bits(data, len);
+}
 
-	void *hdr_buf;
-
-	bool prev_hdr_incomplete;
-	size_t prev_hdr_remaining;
-	size_t prev_content_read_remaining;
-	u32 partial_magic;
-	int partial_magic_bytes;
-	u64 frame_count;
-
-	void *content_buf;
-	size_t content_buf_size;
-	size_t content_buf_used;
-
-	struct pair_parser_ctx *snapshots;
-	size_t snapshots_buffer_size;
-	size_t snapshot_count;
+struct index_header {
+	u32 magic_number;
+	u8 descriptor;
 };
 
-void __attribute__((always_inline)) pair_parser_printf(struct pair_parser_ctx *ctx, FILE *out, char *format, ...) {
-#if DEBUG
-	va_list args;
-	char *myfmt = "[pair_parser_ctx] data_size=%zu prev_hdr_incomplete=%d prev_hdr_remaining=%zu partial_magic=%x partial_magic_bytes=%d frame_count=%ld content_buf_used=%zu content_buf_size=%zu ";
-	char *fmt = malloc(strlen(format) + strlen(myfmt) + 1);
-	strcpy(fmt, myfmt);
-	strcat(fmt, format);
-	va_start(args, format);
-	fprintf(out, myfmt,
-	        ctx->data_size,
-	        ctx->prev_hdr_incomplete,
-	        ctx->prev_hdr_remaining,
-	        ctx->partial_magic,
-	        ctx->partial_magic_bytes,
-	        ctx->frame_count,
-	        ctx->content_buf_used,
-	        ctx->content_buf_size);
-	vfprintf(out, format, args);
-	va_end(args);
-	free(fmt);
-#endif
+#define CHECKSUM_FLAG_MASK 1 << 0
+#define FRAME_FLAG_MASK 1 << 1
+#define FRAME_END_FLAG_MASK 1 << 2
+#define DOFFSET_FLAG_MASK 1 << 3
+#define DOFFSET_END_FLAG_MASK 1 << 4
+
+#define INDEX_MAGIC_NUMBER 0x6A767BE
+#define INDEX_FOOTER_MAGIC_NUMBER 0x3A9B0643
+
+struct index_entry {
+	u64 key;
+	/*
+	   0 0 0 0 0 0 0 0
+	   | | | | | | | |
+	   | | | | | | | +--- checksum flag
+	   | | | | | | +----- frame flag
+	   | | | | | +------- frame end flag
+	   | | | | +--------- doffset flag
+	   | | | +----------- doffset end flag
+	   | | +------------- reserved
+	   | +--------------- reserved
+	   +----------------- reserved
+	*/
+	u8 descriptor;
+	u64 frame_start;
+	u64 frame_end;
+	u64 coffset_start;
+	u64 coffset_end;
+	u64 doffset_start;
+	u64 doffset_end;
+	u32 checksum;
+};
+
+struct index_footer {
+	u32 magic_number;
+	u64 entries_count;
+	u64 entry_size;
+};
+
+struct decompressed_frame_result {
+	u64 frame;
+	size_t c_offset;
+	size_t c_size;
+	size_t d_offset;
+	size_t d_size;
+	ssize_t decompressed_bytes;
+	ssize_t decompressed_bytes_remaining;
+	char *decompressed_data;
+	char *decompressed_data_ptr;
+};
+
+typedef struct index_entrier_package (*index_entrier_create_package)();
+typedef struct index_entrier_return_val (*index_entrier)(struct decompressed_frame_result result, void **entrier_ctx);
+typedef size_t (*index_entrier_init)(void **entrier_ctx);
+typedef size_t (*index_entrier_reset_before_next_frame)(void **entrier_ctx);
+typedef size_t (*index_entrier_reset_before_next_local_iter)(void **entrier_ctx);
+typedef void (*index_entrier_free)(void **entrier_ctx);
+
+struct index_entrier_package {
+	index_entrier entrier;
+	index_entrier_init init;
+	index_entrier_reset_before_next_frame reset_before_next_frame;
+	index_entrier_reset_before_next_local_iter reset_before_next_local_iter;
+	index_entrier_free free;
+};
+
+struct index_entrier_line_entry_ctx {
+	int prev_newline_index;
+	int prev_newline_frame;
+	int newline_index;
+	int last_d_offset;
+	Slice *line_buf;
+	struct index_entry entry;
+	u8 index_mode;
+	int lines;
+};
+
+struct index_entrier_return_val {
+	struct index_entry entry;
+	ssize_t advance_n;
+	bool has_index_entry;
+};
+
+struct index_entrier_return_val index_entrier_line_entry(struct decompressed_frame_result result, void **entrier_ctx) {
+	struct index_entrier_line_entry_ctx **t_ctx = (struct index_entrier_line_entry_ctx **)entrier_ctx;
+	struct index_entrier_return_val ret = {.entry = {0}, .advance_n = 0};
+	u8 index_mode = (*t_ctx)->index_mode;
+	struct index_entry entry;
+	memset(&entry, 0, sizeof(entry));
+	Slice *line_buf = (*t_ctx)->line_buf;
+	char *decompressed_data = result.decompressed_data;
+	char *decompressed_data_ptr = result.decompressed_data_ptr;
+	int last_d_offset = (*t_ctx)->last_d_offset;
+	(*t_ctx)->newline_index = index_of_newline_auto(decompressed_data, (*t_ctx)->newline_index + 1, result.decompressed_bytes);
+	if ((*t_ctx)->newline_index != -1) {
+		size_t diff = (*t_ctx)->newline_index - (*t_ctx)->prev_newline_index;
+		slice_append_n(line_buf, decompressed_data_ptr, diff);
+		char *line = slice_get_ptr_begin_offset(line_buf);
+		size_t line_len = slice_get_len(line_buf);
+		u64 line_hash = xxhash64(line, line_len);
+		slice_reset(line_buf);
+		entry.frame_start = (*t_ctx)->prev_newline_frame;
+		if (entry.frame_start != result.frame) {
+			entry.frame_end = result.frame;
+			entry.descriptor |= FRAME_END_FLAG_MASK;
+		}
+		if (index_mode & DOFFSET_FLAG_MASK) {
+			entry.doffset_start = last_d_offset + 1;
+			entry.descriptor |= DOFFSET_FLAG_MASK;
+		}
+		if (entry.doffset_start != (*t_ctx)->newline_index) {
+			entry.doffset_end = result.d_offset + (*t_ctx)->newline_index;
+			entry.descriptor |= DOFFSET_END_FLAG_MASK;
+		}
+		entry.key = line_hash;
+		(*t_ctx)->prev_newline_index = (*t_ctx)->newline_index;
+		(*t_ctx)->prev_newline_frame = result.frame;
+		(*t_ctx)->lines++;
+		(*t_ctx)->last_d_offset = result.d_offset + (*t_ctx)->newline_index;
+		struct index_entrier_return_val ret = {.entry = entry, .advance_n = diff, .has_index_entry = true};
+		return ret;
+	} else {
+		if (result.decompressed_bytes_remaining >= 0) {
+			slice_append_n(line_buf, decompressed_data_ptr, result.decompressed_bytes_remaining);
+		}
+		struct index_entrier_return_val ret = {.advance_n = result.decompressed_bytes_remaining};
+		return ret;
+	}
 }
 
-void __attribute__((always_inline)) pair_parser_debug(struct pair_parser_ctx *ctx, char *format, ...) {
-#if DEBUG
-	va_list args;
-	va_start(args, format);
-	char buffer[1024];
-	vsnprintf(buffer, sizeof(buffer), format, args);
-	va_end(args);
-	pair_parser_printf(ctx, stderr, "%s", buffer);
-#endif
+size_t index_entrier_line_entry_init(void **entrier_ctx) {
+	struct index_entrier_line_entry_ctx **t_ctx = (struct index_entrier_line_entry_ctx **)entrier_ctx;
+	if (t_ctx == NULL) {
+		return 0;
+	}
+	if (*t_ctx == NULL) {
+		*t_ctx = malloc(sizeof(struct index_entrier_line_entry_ctx));
+		if (*t_ctx == NULL) {
+			fprintf(stderr, "malloc() ctx failed!\n");
+			return 0;
+		}
+	}
+	memset(*t_ctx, 0, sizeof(struct index_entrier_line_entry_ctx));
+	if ((*t_ctx)->line_buf == NULL) {
+		(*t_ctx)->line_buf = slice_char_new(1 * 1024 * 1024, 0);
+		if ((*t_ctx)->line_buf == NULL) {
+			fprintf(stderr, "Slice *line_buf = slice_char_new() failed!\n");
+			return 0;
+		}
+	}
+	(*t_ctx)->newline_index = -1;
+	(*t_ctx)->last_d_offset = -1;
+	(*t_ctx)->index_mode = 0 | CHECKSUM_FLAG_MASK | FRAME_FLAG_MASK | FRAME_END_FLAG_MASK | DOFFSET_FLAG_MASK | DOFFSET_END_FLAG_MASK;
+	return 1;
 }
 
-struct pair_parser_ctx __attribute__((always_inline)) * snapshot_state(struct pair_parser_ctx *ctx) {
-#if false
-	if (ctx->snapshots == NULL) {
-		return NULL;
-	}
-
-	struct pair_parser_ctx *new_ctx = malloc(sizeof(struct pair_parser_ctx));
-	if (new_ctx == NULL) {
-		return NULL;
-	}
-
-	memcpy(new_ctx, ctx, sizeof(struct pair_parser_ctx));
-
-	if (ctx->content_buf != NULL && ctx->content_buf_size > 0) {
-		new_ctx->content_buf = malloc(ctx->content_buf_size);
-		if (new_ctx->content_buf == NULL) {
-			free(new_ctx);
-			return NULL;
-		}
-		memcpy(new_ctx->content_buf, ctx->content_buf, ctx->content_buf_used);
-	}
-
-	if (ctx->hdr_buf != NULL) {
-		new_ctx->hdr_buf = malloc(sizeof(struct offset_content_pair));
-		if (new_ctx->hdr_buf == NULL) {
-			free(new_ctx->content_buf);
-			free(new_ctx);
-			return NULL;
-		}
-		memcpy(new_ctx->hdr_buf, ctx->hdr_buf, sizeof(struct offset_content_pair));
-	}
-
-	if (ctx->data != NULL && ctx->data_size > 0) {
-		new_ctx->data = malloc(ctx->data_size);
-		if (new_ctx->data == NULL) {
-			free(new_ctx->content_buf);
-			free(new_ctx->hdr_buf);
-			free(new_ctx);
-			return NULL;
-		}
-		memcpy(new_ctx->data, ctx->data, ctx->data_size);
-		new_ctx->data_ptr = new_ctx->data + (ctx->data_ptr - ctx->data);
-	}
-
-	new_ctx->snapshots = NULL;
-	new_ctx->snapshots_buffer_size = 0;
-	new_ctx->snapshot_count = 0;
-
-	if (ctx->snapshots_buffer_size < ctx->snapshot_count + 1) {
-		ctx->snapshots_buffer_size = ctx->snapshot_count + 1;
-		ctx->snapshots = realloc(ctx->snapshots, ctx->snapshots_buffer_size * sizeof(struct pair_parser_ctx));
-		if (ctx->snapshots == NULL) {
-			fprintf(stderr, "realloc() snapshots failed!\n");
-			free(new_ctx->content_buf);
-			free(new_ctx->hdr_buf);
-			free(new_ctx->data);
-			free(new_ctx);
-			return NULL;
-		}
-	}
-
-	memcpy(&ctx->snapshots[ctx->snapshot_count], new_ctx, sizeof(struct pair_parser_ctx));
-	ctx->snapshot_count++;
-
-	return new_ctx;
-#else
-	return NULL;
-#endif
+size_t index_entrier_line_entry_reset_before_next_frame(void **entrier_ctx) {
+	struct index_entrier_line_entry_ctx **t_ctx = (struct index_entrier_line_entry_ctx **)entrier_ctx;
+	(*t_ctx)->prev_newline_index = 0;
+	return 1;
 }
 
-void *realloc_content_buf(struct pair_parser_ctx *ctx, size_t size) {
-	if ((ctx->content_buf_size - ctx->content_buf_used) < size) {
-		size_t new_size = max(ctx->content_buf_used + size, ctx->content_buf_size * 2);
-		ctx->content_buf = realloc(ctx->content_buf, new_size);
-		if (ctx->content_buf == NULL) {
-			fprintf(stderr, "realloc() content_buf failed!\n");
-			return NULL;
+void index_entrier_line_entry_free(void **entrier_ctx) {
+	struct index_entrier_line_entry_ctx **t_ctx = (struct index_entrier_line_entry_ctx **)entrier_ctx;
+	if (*t_ctx != NULL) {
+		if ((*t_ctx)->line_buf != NULL) {
+			slice_free((*t_ctx)->line_buf);
 		}
-		ctx->content_buf_size = new_size;
+		free(*t_ctx);
+		*t_ctx = NULL;
 	}
-	return (char *)ctx->content_buf + ctx->content_buf_used;
 }
 
-int copy_to_content_buf(struct pair_parser_ctx *ctx, char *data, size_t size) {
-	void *write_pos = realloc_content_buf(ctx, size);
-	if (write_pos == NULL) {
-		return -1;
-	}
-	memcpy(write_pos, data, size);
-	ctx->content_buf_used += size;
-	return 0;
+struct index_entrier_package newline_entrier_create_package() {
+	return (struct index_entrier_package){
+	    .entrier = index_entrier_line_entry,
+	    .init = index_entrier_line_entry_init,
+	    .reset_before_next_frame = index_entrier_line_entry_reset_before_next_frame,
+	    .reset_before_next_local_iter = NULL,
+	    .free = index_entrier_line_entry_free};
 }
 
-struct offset_content_pair *
-get_next_content_pair(struct pair_parser_ctx *ctx) {
-	while (ctx->data_size > 0) {
-		if (ctx->prev_hdr_incomplete) {
-			pair_parser_debug(ctx, "ctx->prev_hdr_incomplete\n");
-
-			size_t copy_start_offset = sizeof(struct offset_content_pair) - ctx->prev_hdr_remaining;
-			if (ctx->data_size >= ctx->prev_hdr_remaining) {
-				pair_parser_debug(ctx, "ctx->data_size >= ctx->prev_hdr_remaining\n");
-
-				memcpy(ctx->hdr_buf + copy_start_offset, ctx->data_ptr, ctx->prev_hdr_remaining);
-				ctx->data_ptr += ctx->prev_hdr_remaining;
-				ctx->data_size -= ctx->prev_hdr_remaining;
-				ctx->prev_hdr_incomplete = false;
-
-				struct offset_content_pair *pair = (struct offset_content_pair *)ctx->hdr_buf;
-
-				if (pair->content_length > 1024 * 1024 * 1024) {  // 1GB limit
-					fprintf(stderr, "Content length too large: %zu\n", pair->content_length);
-					return NULL;
-				}
-
-				if (ctx->data_size <= pair->content_length) {
-					pair_parser_debug(ctx, "ctx->data_size <= pair->content_length\n");
-
-					if (copy_to_content_buf(ctx, ctx->data_ptr, ctx->data_size) != 0) {
-						return NULL;
-					}
-					ctx->data_ptr += ctx->data_size;
-					ctx->prev_content_read_remaining = pair->content_length - ctx->data_size;
-					ctx->data_size = 0;
-				} else {
-					pair_parser_debug(ctx, "ctx->data_size > pair->content_length\n");
-
-					if (copy_to_content_buf(ctx, ctx->data_ptr, pair->content_length) != 0) {
-						return NULL;
-					}
-					ctx->data_ptr += pair->content_length;
-					ctx->data_size -= pair->content_length;
-					snapshot_state(ctx);
-					// Full pair, no content. Content is read from ctx->content_buf
-					return pair;
-				}
-			} else {
-				pair_parser_debug(ctx, "ctx->data_size <= pair->content_length\n");
-
-				memcpy(ctx->hdr_buf + copy_start_offset, ctx->data_ptr, ctx->data_size);
-				ctx->prev_hdr_remaining -= ctx->data_size;
-				ctx->data_size = 0;
-				continue;
-			}
-		} else if (ctx->prev_content_read_remaining > 0) {
-			pair_parser_debug(ctx, "ctx->prev_content_read_remaining > 0\n");
-
-			if (ctx->prev_content_read_remaining <= ctx->data_size) {
-				pair_parser_debug(ctx, "ctx->prev_content_read_remaining <= ctx->data_size\n");
-
-				if (copy_to_content_buf(ctx, ctx->data_ptr, ctx->prev_content_read_remaining) != 0) {
-					return NULL;
-				}
-				ctx->data_ptr += ctx->prev_content_read_remaining;
-				ctx->data_size -= ctx->prev_content_read_remaining;
-				ctx->prev_content_read_remaining = 0;
-				snapshot_state(ctx);
-				return (struct offset_content_pair *)ctx->data_ptr;
-			} else {
-				pair_parser_debug(ctx, "ctx->prev_content_read_remaining > ctx->data_size\n");
-
-				if (copy_to_content_buf(ctx, ctx->data_ptr, ctx->data_size) != 0) {
-					return NULL;
-				}
-				ctx->prev_content_read_remaining -= ctx->data_size;
-				ctx->data_size = 0;
-				snapshot_state(ctx);
-				continue;
-			}
-		}
-
-		// Search magic number
-		bool found_magic = false;
-		while (ctx->data_size > 0) {
-			if (ctx->partial_magic_bytes > 0) {
-				pair_parser_debug(ctx, "ctx->partial_magic_bytes > 0\n");
-
-				int bytes_needed = sizeof(u32) - ctx->partial_magic_bytes;
-				int bytes_available = ctx->data_size < bytes_needed ? ctx->data_size : bytes_needed;
-
-				for (int i = 0; i < bytes_available; i++) {
-					ctx->partial_magic = (ctx->partial_magic << 8) | ctx->data_ptr[i];
-				}
-				ctx->partial_magic_bytes += bytes_available;
-
-				if (ctx->partial_magic_bytes == sizeof(u32)) {
-					pair_parser_debug(ctx, "ctx->partial_magic_bytes == sizeof(u32)\n");
-
-					if (ctx->partial_magic == OFFSET_CONTENT_PAIR_MAGIC) {
-						found_magic = true;
-						ctx->frame_count++;
-						ctx->data_ptr += bytes_available;
-						ctx->data_size -= bytes_available;
-						ctx->partial_magic_bytes = 0;
-						break;
-					} else {
-						ctx->partial_magic_bytes = 0;
-					}
-				} else {
-					pair_parser_debug(ctx, "ctx->partial_magic_bytes != sizeof(u32)\n");
-
-					ctx->data_ptr += bytes_available;
-					ctx->data_size -= bytes_available;
-					continue;
-				}
-			}
-
-			if (ctx->data_size >= sizeof(u32)) {
-				pair_parser_debug(ctx, "ctx->data_size >= sizeof(u32)\n");
-
-				u32 magic;
-				memcpy(&magic, ctx->data_ptr, sizeof(u32));
-				if (magic == OFFSET_CONTENT_PAIR_MAGIC) {
-					found_magic = true;
-					ctx->frame_count++;
-					ctx->data_ptr += sizeof(u32);
-					ctx->data_size -= sizeof(u32);
-					break;
-				}
-				ctx->data_ptr++;
-				ctx->data_size--;
-			} else {
-				pair_parser_debug(ctx, "ctx->data_size < sizeof(u32)\n");
-				ctx->partial_magic = 0;
-				for (int i = 0; i < ctx->data_size; i++) {
-					ctx->partial_magic = (ctx->partial_magic << 8) | ctx->data_ptr[i];
-				}
-				ctx->partial_magic_bytes = ctx->data_size;
-				ctx->data_size = 0;
-				break;
-			}
-		}
-
-		if (!found_magic) {
-			pair_parser_debug(ctx, "has not found magic after allat\n");
-			continue;
-		}
-
-		// Check if we read more than the header length
-		if (ctx->data_size >= sizeof(struct offset_content_pair) - sizeof(u32)) {
-			pair_parser_debug(ctx, "ctx->data_size >= sizeof(struct offset_content_pair) - sizeof(u32)\n");
-
-			memcpy(ctx->hdr_buf, ctx->data_ptr, sizeof(u32));
-			struct offset_content_pair *pair = (struct offset_content_pair *)(ctx->data_ptr - sizeof(u32));
-			ctx->data_ptr += (sizeof(struct offset_content_pair) - sizeof(u32));
-			ctx->data_size -= (sizeof(struct offset_content_pair) - sizeof(u32));
-
-			if (pair->content_length > 1024 * 1024 * 1024) {  // 1GB limit
-				fprintf(stderr, "Content length too large: %zu\n", pair->content_length);
-				snapshot_state(ctx);
-				return NULL;
-			}
-
-			if (ctx->data_size < pair->content_length) {
-				pair_parser_debug(ctx, "ctx->data_size < pair->content_length\n");
-
-				if (copy_to_content_buf(ctx, ctx->data_ptr, ctx->data_size) != 0) {
-					return NULL;
-				}
-				ctx->prev_content_read_remaining = pair->content_length - ctx->data_size;
-				ctx->data_size = 0;
-				snapshot_state(ctx);
-				continue;
-			} else {
-				pair_parser_debug(ctx, "ctx->data_size >= pair->content_length\n");
-
-				if (copy_to_content_buf(ctx, ctx->data_ptr, pair->content_length) != 0) {
-					return NULL;
-				}
-				ctx->data_ptr += pair->content_length;
-				ctx->data_size -= pair->content_length;
-				snapshot_state(ctx);
-				return pair;
-			}
-		} else {
-			pair_parser_debug(ctx, "ctx->data_size < sizeof(struct offset_content_pair) - sizeof(u32)\n");
-
-			ctx->prev_hdr_incomplete = true;
-			ctx->prev_hdr_remaining = sizeof(struct offset_content_pair) - sizeof(u32) - ctx->data_size;
-
-			memcpy(ctx->hdr_buf, ctx->data_ptr - sizeof(u32), sizeof(u32));
-			memcpy(ctx->hdr_buf + sizeof(u32), ctx->data_ptr, ctx->data_size);
-			ctx->data_size = 0;
-		}
-	}
-
-	return NULL;
+bool print_index_entry(void *data, size_t idx, size_t len, size_t cap, void *ctx) {
+	struct index_entry *entry = data;
+	fwrite((u8 *)ctx + entry->doffset_start, entry->doffset_end - entry->doffset_start, 1, stdout);
+	printf("\n");
+	return true;
 }
 
 int build_index_main(int argc, char **argv) {
@@ -1378,21 +891,26 @@ int build_index_main(int argc, char **argv) {
 
 	static struct option long_options[] = {
 	    {"infile", required_argument, 0, 'i'},
+	    {"outfile", required_argument, 0, 'o'},
 	    {"help", no_argument, 0, 'h'},
 	    {0, 0, 0, 0}};
 
 	while (1) {
-		int c = getopt_long(argc, argv, "i:vh", long_options, NULL);
+		int c = getopt_long(argc, argv, "i:o:vh", long_options, NULL);
 		if (c == -1) break;
 
 		switch (c) {
 		case 'i':
 			infile = optarg;
 			break;
+		case 'o':
+			outfile = optarg;
+			break;
 		case 'h':
 			printf("Usage: %s [options]\n", argv[0]);
 			printf("Options:\n");
-			printf("  -i, --infile FILE     Compressed file to build the index from\n");
+			printf("  -i, --infile FILE     Pairs file\n");
+			printf("  -o, --outfile FILE    Index output file\n");
 			printf("  -h, --help            Show this help\n");
 			return 0;
 		case '?':
@@ -1400,108 +918,146 @@ int build_index_main(int argc, char **argv) {
 		}
 	}
 
-	FILE *fin = infile ? fopen_orDie(infile, "rb") : stdin;
+	if (!infile) {
+		fprintf(stderr, "No input file specified\n");
+		return 1;
+	}
+
+	FILE *fin = fopen_orDie(infile, "rb");
 	struct stat st;
 	if (fstat(fileno(fin), &st) != 0) {
 		printf("Failed to stat file: %s\n", strerror(errno));
 		return 1;
 	}
 
-	struct index_entry *index = malloc(1024);
-	size_t prev_newline_offset = 0;
-	size_t prev_newline_frame = 0;
-	free(index);
+	ZSTD_seekable *const seekable = ZSTD_seekable_create();
+	if (seekable == NULL) {
+		fprintf(stderr, "ZSTD_seekable_create() error \n");
+		exit(10);
+	}
 
-	struct pair_parser_ctx ctx;
-	memset(&ctx, 0, sizeof(ctx));
+	u8 *fin_mmap = mmap_or_die(fin, st.st_size);
+	size_t const zstd_init_buf_ret = ZSTD_seekable_initBuff(seekable, fin_mmap, st.st_size);
+	if (ZSTD_isError(zstd_init_buf_ret)) {
+		fprintf(stderr, "ZSTD_seekable_init() error : %s \n", ZSTD_getErrorName(zstd_init_buf_ret));
+		exit(11);
+	}
 
-	struct pair_parser_ctx *snapshots = malloc(sizeof(struct pair_parser_ctx));
-	if (snapshots == NULL) {
-		fprintf(stderr, "malloc() snapshots failed!\n");
+	FILE *out = outfile ? fopen_orDie(outfile, "wb") : stdout;
+
+	size_t const buff_in_size = ZSTD_DStreamInSize();
+	void *buf_in = malloc_orDie(buff_in_size);
+	size_t const buf_out_size = ZSTD_DStreamOutSize();
+	void *buf_out = malloc_orDie(buf_out_size);
+
+	Slice *indices = slice_new(4096, 0, sizeof(struct index_entry));
+	if (indices == NULL) {
+		fprintf(stderr, "Slice *indices = slice_new() failed!\n");
 		return 1;
 	}
-	memset(snapshots, 0, sizeof(struct pair_parser_ctx));
-	ctx.snapshots = snapshots;
+	// to be shown in gdb
+	struct index_entry *entries = slice_get_ptr_begin_offset(indices);
+	struct index_entry *entries_orig = entries;
 
-	size_t buf_size = 10 * 1024 * 1024;
-	// size_t buf_size = st.st_size;
-	ctx.data = malloc_orDie(buf_size);
+	int ret;
 
-	ctx.hdr_buf = malloc_orDie(sizeof(struct offset_content_pair));
-
-	size_t content_buf_size = buf_size;
-	ctx.content_buf = malloc_orDie(content_buf_size);
-	ctx.content_buf_size = content_buf_size;
-
-	char *orig_file = "humongous_file.txt";
-	FILE *orig_file_fin = fopen(orig_file, "r");
-	if (orig_file_fin == NULL) {
-		fprintf(stderr, "Failed to open file: %s\n", orig_file);
-		return 1;
-	}
-	char *orig_file_data = malloc(4096);
-
-	// char *content_str = malloc(4096);
-	// size_t content_str_size = 4096;
-	while ((ctx.data_size = fread_orDie(ctx.data, buf_size, fin))) {
-		ctx.data_ptr = ctx.data;
-
-		while (ctx.data_size > 0) {
-			struct offset_content_pair *pair = get_next_content_pair(&ctx);
-			if (pair == NULL) {
-				break;
-			}
-			int n = fread(orig_file_data, pair->content_length, 1, orig_file_fin);
-			if (memcmp(ctx.content_buf, orig_file_data, pair->content_length) != 0) {
-				pair_parser_debug(&ctx, "Content mismatch on frame %ld, content length: %ld\n", pair->frame_index, pair->content_length);
-				fprintf(stdout, "\n----- Original file content -----\n");
-				fwrite(orig_file_data, pair->content_length, 1, stdout);
-				fprintf(stdout, "\n\n----- Current file content -----\n\n");
-				fwrite(ctx.content_buf, pair->content_length, 1, stdout);
-				fprintf(stdout, "FIN\n");
-				return 1;
-			}
-
-			// dump parser state
-			// fprintf(stdout, "----- Parser states leading up to this mismatch -----\n");
-			// for (int i = 0; i < ctx.snapshot_count; i++) {
-			// struct pair_parser_ctx snapshot = ctx.snapshots[i];
-			// fprintf(stdout, "Snapshot %d:\n", i);
-			// fprintf(stdout, "data_size: %zu\n", snapshot.data_size);
-			// fprintf(stdout, "data_ptr: %p\n", snapshot.data_ptr);
-			// fprintf(stdout, "prev_hdr_incomplete: %d\n", snapshot.prev_hdr_incomplete);
-			// fprintf(stdout, "prev_hdr_remaining: %zu\n", snapshot.prev_hdr_remaining);
-			// fprintf(stdout, "partial_magic: %x\n", snapshot.partial_magic);
-			// fprintf(stdout, "partial_magic_bytes: %d\n", snapshot.partial_magic_bytes);
-			// fprintf(stdout, "frame_count: %ld\n", snapshot.frame_count);
-			// fprintf(stdout, "content_buf_used: %zu\n", snapshot.content_buf_used);
-			// fprintf(stdout, "content_buf_size: %zu\n", snapshot.content_buf_size);
-			// fprintf(stdout, "\n");
-			// }
-
-			// fprintf(stderr, "Content mismatch\n");
-
-			// return 1;
-			// }
-			// fwrite(ctx.content_buf, pair->content_length, 1, stdout);
-			// fwrite(ctx.content_buf, pair->content_length, 1, stdout);
-			// // if (pair->content_length > content_str_size + 1) {
-			// // 	content_str_size = pair->content_length + 1;
-			// // 	content_str = realloc(content_str, content_str_size);
-			// // }
-			// // memcpy(content_str, pair->content, pair->content_length);
-			// // content_str[pair->content_length] = '\0';
-			// // printf("%s\n", content_str);
-			// return 0;
-			ctx.content_buf_used = 0;
-			fwrite(ctx.content_buf, pair->content_length, 1, stdout);
+	struct index_entrier_line_entry_ctx *entrier_ctx = NULL;
+	struct index_entrier_package entrier_package = newline_entrier_create_package();
+	if (entrier_package.init != NULL) {
+		if (!entrier_package.init(&entrier_ctx)) {
+			fprintf(stderr, "entrier_package.init() failed!\n");
+			ret = 1;
+			goto cleanup;
 		}
 	}
 
+	unsigned num_frames = ZSTD_seekable_getNumFrames(seekable);
+	for (unsigned i = 0; i < num_frames; i++) {
+		unsigned long long c_offset = ZSTD_seekable_getFrameCompressedOffset(seekable, i);
+		unsigned long long d_offset = ZSTD_seekable_getFrameDecompressedOffset(seekable, i);
+		size_t c_size = ZSTD_seekable_getFrameCompressedSize(seekable, i);
+		size_t d_size = ZSTD_seekable_getFrameDecompressedSize(seekable, i);
+
+		size_t start_off = d_offset;
+		size_t end_off = d_offset + d_size;
+		while (start_off < end_off) {
+			size_t result = ZSTD_seekable_decompress(seekable, buf_out, MIN(end_off - start_off, buf_out_size), start_off);
+
+			if (!result) {
+				break;
+			}
+			if (ZSTD_isError(result)) {
+				fprintf(stderr, "ZSTD_seekable_decompress() error : %s \n",
+				        ZSTD_getErrorName(result));
+				exit(12);
+			}
+
+			struct decompressed_frame_result dfr = {
+			    .frame = i,
+			    .c_offset = c_offset,
+			    .c_size = c_size,
+			    .d_offset = d_offset,
+			    .d_size = d_size,
+			    .decompressed_bytes = result,
+			    .decompressed_bytes_remaining = result,
+			    .decompressed_data = buf_out,
+			    .decompressed_data_ptr = buf_out,
+			};
+
+			do {
+				struct index_entrier_return_val entrier_retval = entrier_package.entrier(dfr, (void **)&entrier_ctx);
+				if (entrier_retval.has_index_entry && slice_append(indices, &entrier_retval.entry) == NULL) {
+					fprintf(stderr, "slice_append() failed!\n");
+					ret = 1;
+					goto cleanup;
+				}
+				if (entrier_retval.advance_n <= 0) {
+					break;
+				}
+				dfr.decompressed_data_ptr += entrier_retval.advance_n;
+				dfr.decompressed_bytes_remaining -= entrier_retval.advance_n;
+
+				if (entrier_package.reset_before_next_frame != NULL) {
+					if (!entrier_package.reset_before_next_frame(&entrier_ctx)) {
+						fprintf(stderr, "entrier_package.reset_before_next_frame() failed!\n");
+						ret = 1;
+						goto cleanup;
+					}
+				}
+			} while (true);
+
+			start_off += result;
+		}
+	}
+
+	FILE *f_orig = fopen_orDie("humongous_file.txt", "r");
+	if (f_orig == NULL) {
+		fprintf(stderr, "fopen() fout_orig failed!\n");
+		return 1;
+	}
+	struct stat orig_st;
+	if (fstat(fileno(f_orig), &orig_st) != 0) {
+		printf("Failed to stat file: %s\n", strerror(errno));
+		return 1;
+	}
+	u8 *f_orig_mmap = mmap(NULL, orig_st.st_size, PROT_READ, MAP_PRIVATE, fileno(f_orig), 0);
+	if (f_orig_mmap == MAP_FAILED) {
+		printf("Failed to map file: %s\n", strerror(errno));
+		return 1;
+	}
+
+	slice_range(indices, f_orig_mmap, print_index_entry);
+
 cleanup:
-	free(ctx.data);
-	free(ctx.hdr_buf);
-	free(ctx.content_buf);
-	if (fin != stdin) fclose(fin);
-	return 0;
+	fclose_orDie(f_orig);
+	munmap(fin_mmap, st.st_size);
+	munmap(f_orig_mmap, orig_st.st_size);
+	if (entrier_ctx != NULL && entrier_package.free != NULL) {
+		entrier_package.free(&entrier_ctx);
+	}
+	ZSTD_seekable_free(seekable);
+	free(buf_in);
+	free(buf_out);
+	slice_free(indices);
+	return ret;
 }

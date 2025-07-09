@@ -16,6 +16,15 @@
         "numeric": "c",
         "semaphore": "c",
         "algorithm": "c",
-        "thread": "c"
+        "thread": "c",
+        "slice.h": "c",
+        "xxh3.h": "c",
+        "xxhash.h": "c",
+        "zstd_seekable.h": "c",
+        "zstd.h": "c",
+        "compiler.h": "c",
+        "zstd_errors.h": "c",
+        "text_encoding": "c",
+        "typeinfo": "c"
     }
 }
