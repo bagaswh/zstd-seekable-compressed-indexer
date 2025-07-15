@@ -25,6 +25,14 @@
         "compiler.h": "c",
         "zstd_errors.h": "c",
         "text_encoding": "c",
-        "typeinfo": "c"
+        "typeinfo": "c",
+        "cerrno": "c",
+        "charconv": "c",
+        "compare": "c",
+        "ratio": "c",
+        "tuple": "c",
+        "type_traits": "c",
+        "utility": "c",
+        "variant": "c"
     }
 }

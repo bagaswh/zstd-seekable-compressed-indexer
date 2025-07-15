@@ -20,6 +20,7 @@
 #include "zstd_seekable.h"
 
 typedef uint8_t u8;
+typedef int8_t i8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
@@ -58,6 +59,8 @@ void print_usage(const char *program_name) {
 #define ERR_ZSTD_COMPRESS 3
 
 /* Utils */
+
+#define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
 
 typedef enum {
@@ -471,8 +474,6 @@ int info_main(int argc, char **argv) {
 	return 0;
 }
 
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-
 /* ---- begin CPUID ---- */
 
 // Function to execute CPUID instruction
@@ -675,65 +676,204 @@ int index_of_newline_avx2_aligned(char *data, ssize_t start, ssize_t size) {
 
 int index_of_newline_auto(char *data, ssize_t start, ssize_t size) {
 	if (start < 0 || start >= size) return -1;
+	if ((size - start) < 32) {
+		return index_of_newline_scalar(data, start, size);
+	}
+	if ((size - start) < 128 && check_sse4_support()) {
+		return index_of_newline_sse(data, start, size);
+	}
+	if ((size - start) < 256 && check_avx2_support()) {
+		return index_of_newline_avx2(data, start, size);
+	}
 	return index_of_newline_scalar(data, start, size);
-	// if ((size - start) < 32) {
-	// }
-	// if ((size - start) < 128 && check_sse4_support()) {
-	// 	return index_of_newline_sse(data, start, size);
-	// }
-	// if ((size - start) < 256 && check_avx2_support()) {
-	// 	return index_of_newline_avx2(data, start, size);
-	// }
-	// return index_of_newline_scalar(data, start, size);
 }
 
-u64 __attribute__((always_inline)) xxhash64(void *data, size_t len) {
-	return XXH3_64bits(data, len);
+union xxhash64_result {
+	u8 bytes[8];
+	u64 value;
+};
+
+union xxhash64_result __attribute__((always_inline)) xxhash64(void *data, size_t len) {
+	return (union xxhash64_result)XXH3_64bits(data, len);
 }
+
+#define CHECKSUM_FLAG_MASK 1 << 0
+
+#define FRAME_SIZE_FLAG_MASK 1 << 0
+#define OFFSET_WITHIN_FRAME_FLAG_MASK 1 << 7
+
+#define INDEX_MAGIC_NUMBER 0x6A767BE
+#define INDEX_GROUP_MAGIC_NUMBER 0x3A9B0643
 
 struct index_header {
 	u32 magic_number;
+
+	// Descriptor
+	// 0 0 0 0 0 0 0 0
+	// | | | | | | | |
+	// | | | | | | | +--- checksum flag
+	// | | | | | | +----- unused
+	// | | | | | +------- unused
+	// | | | | +--------- unused
+	// | | | +----------- unused
+	// | | +------------- unused
+	// | +--------------- unused
 	u8 descriptor;
 };
 
-#define CHECKSUM_FLAG_MASK 1 << 0
-#define FRAME_FLAG_MASK 1 << 1
-#define FRAME_END_FLAG_MASK 1 << 2
-#define DOFFSET_FLAG_MASK 1 << 3
-#define DOFFSET_END_FLAG_MASK 1 << 4
-
-#define INDEX_MAGIC_NUMBER 0x6A767BE
-#define INDEX_FOOTER_MAGIC_NUMBER 0x3A9B0643
-
-struct index_entry {
-	u64 key;
-	/*
-	   0 0 0 0 0 0 0 0
-	   | | | | | | | |
-	   | | | | | | | +--- checksum flag
-	   | | | | | | +----- frame flag
-	   | | | | | +------- frame end flag
-	   | | | | +--------- doffset flag
-	   | | | +----------- doffset end flag
-	   | | +------------- reserved
-	   | +--------------- reserved
-	   +----------------- reserved
-	*/
-	u8 descriptor;
-	u64 frame_start;
-	u64 frame_end;
-	u64 coffset_start;
-	u64 coffset_end;
-	u64 doffset_start;
-	u64 doffset_end;
-	u32 checksum;
+struct index_group_table_entry {
+	u64 offset;
 };
 
-struct index_footer {
+struct index_group_header {
 	u32 magic_number;
-	u64 entries_count;
 	u64 entry_size;
+	u64 entries_count;
 };
+
+/*
+    The actual on-disk layout of the index entry is as follows:
+
+    | key | descriptor | frame_start | frame_size | offset_within_frame_start | offset_within_frame_end | checksum (optional) |
+    +-----+------------+-------------+------------+--------------------------+--------------------------+----------------------+
+    | 8   | 1          | 8           | 8          | 8                        | 8                        | 4                    |
+
+    The struct fields are arranged in this way to minimize paddings.
+*/
+struct index_entry {
+	union xxhash64_result key;
+	u64 frame_start;
+	u64 frame_size;
+	u64 offset_within_frame_start;
+	u64 offset_within_frame_end;
+
+	u32 checksum;
+
+	// Descriptor bit layout:
+	//
+	//  15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+	// ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+	// │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │
+	// └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+	//         │  │  │  │  │  │  │  │  │  │  │  │  │  │
+	//         │  │  │  │  │  │  │  │  │  │  │  │  │  └─── bit 0      : frame size flag
+	//         │  │  │  │  │  │  │  │  │  │  └──┴──┴────── bit 1-3    : frame start byte size length
+	//         │  │  │  │  │  │  │  └──┴──┴─────────────── bit 4-6    : frame size byte size length
+	//         │  │  │  │  │  │  └──────────────────────── bit 7      : offset_within_frame flag
+	//         │  │  │  └──┴──┴─────────────────────────── bit 8-10   : offset_within_frame byte size length
+	//         └──┴──┴──────────────────────────────────── bit 11-13  : offset_within_frame_end byte size length
+	//
+	u16 descriptor;
+};
+
+struct index_header create_index_header(bool with_checksum) {
+	struct index_header header = {.magic_number = INDEX_MAGIC_NUMBER, .descriptor = with_checksum ? CHECKSUM_FLAG_MASK : 0};
+	return header;
+}
+
+size_t write_index_header(FILE *stream, struct index_header hdr) {
+	char buf[sizeof(struct index_header)];
+	size_t written = 0;
+	memcpy(buf, &((u32){INDEX_MAGIC_NUMBER}), sizeof(u32));
+	written += sizeof(u32);
+	memccpy(buf + written, &hdr.descriptor, 0, sizeof(u8));
+	written += sizeof(u8);
+	return fwrite(buf, written, 1, stream);
+}
+
+size_t write_index_group_header(FILE *stream, struct index_header hdr, u64 entry_size, u64 entries_count) {
+	if (hdr.descriptor & CHECKSUM_FLAG_MASK) {
+		entry_size += sizeof(u32);
+	}
+	size_t written = 0;
+	char buf[sizeof(struct index_group_header)];
+	memcpy(buf, &((u32){INDEX_GROUP_MAGIC_NUMBER}), sizeof(u32));
+	written += sizeof(u32);
+	memccpy(buf + written, &entries_count, 0, sizeof(u64));
+	written += sizeof(u64);
+	memccpy(buf + written, &entry_size, 0, sizeof(u64));
+	written += sizeof(u64);
+	return fwrite(buf, written, 1, stream);
+}
+
+#define sizeof_struct_member(type, member) sizeof(((type *)0)->member)
+#define sizeof_index_entry_member(member) sizeof_struct_member(struct index_entry, member)
+
+i8 get_byte_length(size_t value) {
+	if (value <= UINT8_MAX) {
+		return 1;
+	} else if (value <= UINT16_MAX) {
+		return 2;
+	} else if (value <= UINT32_MAX) {
+		return 3;
+	} else if (value <= UINT64_MAX) {
+		return 4;
+	}
+	return -1;
+}
+
+size_t write_index_entry(FILE *stream, u8 index_mode, struct index_header hdr, struct index_entry entry) {
+	size_t written = 0;
+
+	char buf[sizeof(struct index_entry)];
+
+	size_t checksum_size = sizeof_index_entry_member(checksum);
+	memcpy(buf, &entry.key, sizeof_index_entry_member(key));
+	written += sizeof_index_entry_member(key);
+
+	char *descriptor_buf_ptr = buf + sizeof_index_entry_member(key);
+	char *frame_start_buf_ptr = descriptor_buf_ptr + sizeof_index_entry_member(descriptor);
+	char *frame_size_buf_ptr = frame_start_buf_ptr + sizeof_index_entry_member(frame_start);
+	char *offset_within_frame_start_buf_ptr = frame_size_buf_ptr + sizeof_index_entry_member(frame_size);
+	char *offset_within_frame_end_buf_ptr = offset_within_frame_start_buf_ptr + sizeof_index_entry_member(offset_within_frame_start);
+
+	u16 descriptor = 0;
+
+	i8 frame_start_byte_length = get_byte_length(entry.frame_start);
+	if (frame_start_byte_length < 0) {
+		fprintf(stderr, "frame_start_byte_length is invalid\n");
+		return 0;
+	}
+	// frame start byte length
+	if (frame_start_byte_length > 1) {
+		descriptor |= (frame_start_byte_length << 1);
+	}
+	memcpy(frame_start_buf_ptr, &entry.frame_start, frame_start_byte_length);
+	written += frame_start_byte_length;
+
+	i8 frame_size_byte_length = get_byte_length(entry.frame_size);
+	if (entry.frame_size > 0) {
+		descriptor |= FRAME_SIZE_FLAG_MASK;
+		if (frame_size_byte_length < 0) {
+			fprintf(stderr, "frame_size_byte_length is invalid\n");
+			return 0;
+		}
+		// frame size byte length
+		if (frame_size_byte_length > 1) {
+			descriptor |= (frame_size_byte_length << 4);
+		}
+		memcpy(frame_size_buf_ptr, &entry.frame_size, frame_size_byte_length);
+		written += frame_size_byte_length;
+	}
+
+	memcpy(descriptor_buf_ptr, &descriptor, sizeof(descriptor));
+	written += sizeof(descriptor);
+
+	return fwrite(buf, written, 1, stream);
+}
+
+size_t write_index_group_table(FILE *stream, struct index_group_table_entry *entries, u64 entries_count) {
+	size_t written = 0;
+	for (size_t i = 0; i < entries_count; i++) {
+		size_t to_write = min(entries_count * sizeof(struct index_group_table_entry), 50 * sizeof(struct index_group_table_entry));
+		size_t ret = fwrite(entries, to_write, 1, stream);
+		if (ret != 1) {
+			return 0;
+		}
+		written += ret;
+	}
+	return written;
+}
 
 struct decompressed_frame_result {
 	u64 frame;
@@ -782,39 +922,42 @@ struct index_entrier_return_val {
 struct index_entrier_return_val index_entrier_line_entry(struct decompressed_frame_result result, void **entrier_ctx) {
 	struct index_entrier_line_entry_ctx **t_ctx = (struct index_entrier_line_entry_ctx **)entrier_ctx;
 	struct index_entrier_return_val ret = {.entry = {0}, .advance_n = 0};
+
 	u8 index_mode = (*t_ctx)->index_mode;
+
 	struct index_entry entry;
 	memset(&entry, 0, sizeof(entry));
+
 	Slice *line_buf = (*t_ctx)->line_buf;
+
 	char *decompressed_data = result.decompressed_data;
 	char *decompressed_data_ptr = result.decompressed_data_ptr;
-	int last_d_offset = (*t_ctx)->last_d_offset;
-	(*t_ctx)->newline_index = index_of_newline_auto(decompressed_data, (*t_ctx)->newline_index + 1, result.decompressed_bytes);
+	(*t_ctx)->newline_index = index_of_newline_auto(decompressed_data, (*t_ctx)->prev_newline_index + 1, result.decompressed_bytes);
 	if ((*t_ctx)->newline_index != -1) {
-		size_t diff = (*t_ctx)->newline_index - (*t_ctx)->prev_newline_index;
+		ssize_t diff = (*t_ctx)->newline_index - (*t_ctx)->prev_newline_index;
+		if (diff < 0) {
+			fwrite(decompressed_data, 1, (*t_ctx)->newline_index, stdout);
+		}
 		slice_append_n(line_buf, decompressed_data_ptr, diff);
+
 		char *line = slice_get_ptr_begin_offset(line_buf);
 		size_t line_len = slice_get_len(line_buf);
-		u64 line_hash = xxhash64(line, line_len);
+		union xxhash64_result line_hash = xxhash64(line, line_len);
+		entry.key = line_hash;
+
 		slice_reset(line_buf);
+
 		entry.frame_start = (*t_ctx)->prev_newline_frame;
 		if (entry.frame_start != result.frame) {
-			entry.frame_end = result.frame;
-			entry.descriptor |= FRAME_END_FLAG_MASK;
+			entry.frame_size = result.frame - entry.frame_start;
 		}
-		if (index_mode & DOFFSET_FLAG_MASK) {
-			entry.doffset_start = last_d_offset + 1;
-			entry.descriptor |= DOFFSET_FLAG_MASK;
-		}
-		if (entry.doffset_start != (*t_ctx)->newline_index) {
-			entry.doffset_end = result.d_offset + (*t_ctx)->newline_index;
-			entry.descriptor |= DOFFSET_END_FLAG_MASK;
-		}
-		entry.key = line_hash;
+		entry.offset_within_frame_start = (*t_ctx)->prev_newline_index + 1;
+		entry.offset_within_frame_end = (*t_ctx)->newline_index;
+
 		(*t_ctx)->prev_newline_index = (*t_ctx)->newline_index;
 		(*t_ctx)->prev_newline_frame = result.frame;
 		(*t_ctx)->lines++;
-		(*t_ctx)->last_d_offset = result.d_offset + (*t_ctx)->newline_index;
+
 		struct index_entrier_return_val ret = {.entry = entry, .advance_n = diff, .has_index_entry = true};
 		return ret;
 	} else {
@@ -848,7 +991,7 @@ size_t index_entrier_line_entry_init(void **entrier_ctx) {
 	}
 	(*t_ctx)->newline_index = -1;
 	(*t_ctx)->last_d_offset = -1;
-	(*t_ctx)->index_mode = 0 | CHECKSUM_FLAG_MASK | FRAME_FLAG_MASK | FRAME_END_FLAG_MASK | DOFFSET_FLAG_MASK | DOFFSET_END_FLAG_MASK;
+	(*t_ctx)->index_mode = 0 | FRAME_SIZE_FLAG_MASK | OFFSET_WITHIN_FRAME_FLAG_MASK;
 	return 1;
 }
 
@@ -878,11 +1021,60 @@ struct index_entrier_package newline_entrier_create_package() {
 	    .free = index_entrier_line_entry_free};
 }
 
-bool print_index_entry(void *data, size_t idx, size_t len, size_t cap, void *ctx) {
-	struct index_entry *entry = data;
-	fwrite((u8 *)ctx + entry->doffset_start, entry->doffset_end - entry->doffset_start, 1, stdout);
-	printf("\n");
-	return true;
+static void inline zero_fill(u8 *arr, size_t len) {
+	memset(arr, 0, len);
+}
+
+struct radix_sort_item_key {
+	u8 *key;
+	size_t size;
+};
+
+struct radix_sort_args {
+	void *arr;
+	size_t rows;
+	size_t elem_size;
+	size_t cols;
+	struct radix_sort_item_key (*arr_key)(void *item, size_t idx);
+};
+
+static void radix_sort_8bit_digits(struct radix_sort_args args) {
+	i64 iters = 0;
+
+	size_t cols = args.cols;
+
+	for (int j = cols - 1; j >= 0; j--) {
+		zero_fill(bucket, bucket_len);
+		zero_fill(freqbucket, bucket_len);
+
+		for (int i = 0; i < rows; i++) {
+			u8 digit = arr[i * cols + j];
+			freqbucket[digit]++;
+		}
+
+		memcpy(bucket, freqbucket, bucket_len);
+
+		for (int i = 1; i < bucket_len; i++) {
+			bucket[i] += bucket[i - 1];
+		}
+
+		for (int i = bucket_len - 1; i > 0; --i) {
+			bucket[i] = bucket[i - 1];
+			if (i == 1) {
+				bucket[i - 1] = 0;
+			}
+		}
+
+		int row = 0;
+		for (int i = 0; i < bucket_len; i++) {
+			u8 freq = freqbucket[i];
+			while (freq > 0) {
+				arr[row * cols + j] = i;
+				freq--;
+				row++;
+			}
+		}
+	}
 }
 
 int build_index_main(int argc, char **argv) {
@@ -918,8 +1110,8 @@ int build_index_main(int argc, char **argv) {
 		}
 	}
 
-	if (!infile) {
-		fprintf(stderr, "No input file specified\n");
+	if (!infile || !outfile) {
+		fprintf(stderr, "No input or output file specified\n");
 		return 1;
 	}
 
@@ -943,35 +1135,56 @@ int build_index_main(int argc, char **argv) {
 		exit(11);
 	}
 
-	FILE *out = outfile ? fopen_orDie(outfile, "wb") : stdout;
+	FILE *fout = fopen_orDie(outfile, "wb");
 
 	size_t const buff_in_size = ZSTD_DStreamInSize();
 	void *buf_in = malloc_orDie(buff_in_size);
 	size_t const buf_out_size = ZSTD_DStreamOutSize();
 	void *buf_out = malloc_orDie(buf_out_size);
 
-	Slice *indices = slice_new(4096, 0, sizeof(struct index_entry));
-	if (indices == NULL) {
-		fprintf(stderr, "Slice *indices = slice_new() failed!\n");
-		return 1;
-	}
-	// to be shown in gdb
-	struct index_entry *entries = slice_get_ptr_begin_offset(indices);
-	struct index_entry *entries_orig = entries;
+	int ret = 0;
 
-	int ret;
+	size_t groups_entries_count = 0;
+	// Calculate how many entries that can fit in 1 GB of memory
+	size_t group_max_entries = (1024 * 1024 * 1024) / sizeof(struct index_entry);
+	Slice *group_entries = slice_new(group_max_entries, 0, sizeof(struct index_entry));
+	if (group_entries == NULL) {
+		fprintf(stderr, "Slice *group_entries = slice_new failed!\n");
+		ret = 1;
+		goto cleanup;
+	}
+
+	struct index_group_table_entry *group_table_entries = malloc(sizeof(struct index_group_table_entry) * group_max_entries);
+	if (group_table_entries == NULL) {
+		fprintf(stderr, "group_table_entries = malloc failed!\n");
+		ret = 1;
+		goto cleanup;
+	}
+	u64 group_table_entries_count = 0;
+
+	u8 index_mode = 0 | FRAME_SIZE_FLAG_MASK | OFFSET_WITHIN_FRAME_FLAG_MASK;
 
 	struct index_entrier_line_entry_ctx *entrier_ctx = NULL;
 	struct index_entrier_package entrier_package = newline_entrier_create_package();
 	if (entrier_package.init != NULL) {
-		if (!entrier_package.init(&entrier_ctx)) {
+		if (!entrier_package.init((void **)&entrier_ctx)) {
 			fprintf(stderr, "entrier_package.init() failed!\n");
 			ret = 1;
 			goto cleanup;
 		}
 	}
 
+	struct index_header idx_hdr = create_index_header(false);
+
 	unsigned num_frames = ZSTD_seekable_getNumFrames(seekable);
+	if (num_frames > 0) {
+		if (!write_index_header(fout, idx_hdr)) {
+			fprintf(stderr, "write_index_header() failed!\n");
+			ret = 1;
+			goto cleanup;
+		}
+	}
+
 	for (unsigned i = 0; i < num_frames; i++) {
 		unsigned long long c_offset = ZSTD_seekable_getFrameCompressedOffset(seekable, i);
 		unsigned long long d_offset = ZSTD_seekable_getFrameDecompressedOffset(seekable, i);
@@ -981,7 +1194,7 @@ int build_index_main(int argc, char **argv) {
 		size_t start_off = d_offset;
 		size_t end_off = d_offset + d_size;
 		while (start_off < end_off) {
-			size_t result = ZSTD_seekable_decompress(seekable, buf_out, MIN(end_off - start_off, buf_out_size), start_off);
+			size_t result = ZSTD_seekable_decompress(seekable, buf_out, min(end_off - start_off, buf_out_size), start_off);
 
 			if (!result) {
 				break;
@@ -1006,58 +1219,57 @@ int build_index_main(int argc, char **argv) {
 
 			do {
 				struct index_entrier_return_val entrier_retval = entrier_package.entrier(dfr, (void **)&entrier_ctx);
-				if (entrier_retval.has_index_entry && slice_append(indices, &entrier_retval.entry) == NULL) {
-					fprintf(stderr, "slice_append() failed!\n");
-					ret = 1;
-					goto cleanup;
+				if (entrier_retval.has_index_entry) {
+					// indices++;
+					if (slice_get_len(group_entries) == group_max_entries) {
+						slice_reset(group_entries);
+					}
+					if (!slice_append(group_entries, &entrier_retval.entry)) {
+						fprintf(stderr, "slice_append() failed!\n");
+						ret = 1;
+						goto cleanup;
+					}
+					// if (!write_index_entry(fout, index_mode, idx_hdr, entrier_retval.entry)) {
+					// 	fprintf(stderr, "write_index() failed!\n");
+					// 	ret = 1;
+					// 	goto cleanup;
+					// }
 				}
+				// if (indices % 1000000 == 0) {
+				// 	fprintf(stderr, "Created %lld indices\n", indices);
+				// }
 				if (entrier_retval.advance_n <= 0) {
 					break;
 				}
 				dfr.decompressed_data_ptr += entrier_retval.advance_n;
 				dfr.decompressed_bytes_remaining -= entrier_retval.advance_n;
-
-				if (entrier_package.reset_before_next_frame != NULL) {
-					if (!entrier_package.reset_before_next_frame(&entrier_ctx)) {
-						fprintf(stderr, "entrier_package.reset_before_next_frame() failed!\n");
-						ret = 1;
-						goto cleanup;
-					}
-				}
 			} while (true);
+
+			if (entrier_package.reset_before_next_frame != NULL) {
+				if (!entrier_package.reset_before_next_frame((void **)&entrier_ctx)) {
+					fprintf(stderr, "entrier_package.reset_before_next_frame() failed!\n");
+					ret = 1;
+					goto cleanup;
+				}
+			}
 
 			start_off += result;
 		}
 	}
 
-	FILE *f_orig = fopen_orDie("humongous_file.txt", "r");
-	if (f_orig == NULL) {
-		fprintf(stderr, "fopen() fout_orig failed!\n");
-		return 1;
-	}
-	struct stat orig_st;
-	if (fstat(fileno(f_orig), &orig_st) != 0) {
-		printf("Failed to stat file: %s\n", strerror(errno));
-		return 1;
-	}
-	u8 *f_orig_mmap = mmap(NULL, orig_st.st_size, PROT_READ, MAP_PRIVATE, fileno(f_orig), 0);
-	if (f_orig_mmap == MAP_FAILED) {
-		printf("Failed to map file: %s\n", strerror(errno));
-		return 1;
-	}
-
-	slice_range(indices, f_orig_mmap, print_index_entry);
+	// if (!write_index_footer(fout, idx_hdr, indices)) {
+	// 	fprintf(stderr, "write_index_footer() failed!\n");
+	// 	ret = 1;
+	// 	goto cleanup;
+	// }
 
 cleanup:
-	fclose_orDie(f_orig);
 	munmap(fin_mmap, st.st_size);
-	munmap(f_orig_mmap, orig_st.st_size);
 	if (entrier_ctx != NULL && entrier_package.free != NULL) {
-		entrier_package.free(&entrier_ctx);
+		entrier_package.free((void **)&entrier_ctx);
 	}
 	ZSTD_seekable_free(seekable);
 	free(buf_in);
 	free(buf_out);
-	slice_free(indices);
 	return ret;
 }
